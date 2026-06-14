@@ -1,4 +1,4 @@
-# OCR Engine v4.4.0 — PDF 搜尋化與品質分析系統
+# OCR Engine v4.4.2 — PDF 搜尋化與品質分析系統（Worker Process Safety）
 
 ## 專案功能
 
@@ -11,6 +11,10 @@
 - 品質分析報告（低置信度、亂碼標記、公式偵測）
 - GPU 自動偵測與安全回退 CPU
 - Nougat / Surya 可選引擎安全停用
+- **GUI 使用獨立 OCR worker process（v4.4.2 新增）**
+- 原生 CUDA / Paddle 崩潰不再關閉 GUI
+- 每頁 checkpoint 寫入，支援斷點續跑
+- GPU crash 自動重試，二次失敗自動改 CPU
 
 ---
 
@@ -18,16 +22,22 @@
 
 ```
 OCR/
-├── ocr_core.py          # 核心 OCR 邏輯、OCRConfig、OCRProcessor
-├── ocr_engine.py        # CLI 入口（互動模式 + argparse 模式）
-├── ocr_gui.py           # tkinter 圖形介面
-├── settings_manager.py  # GUI 設定持久化
-├── run_gui.bat          # 一鍵啟動 GUI
-├── run_cli.bat          # 一鍵啟動互動式 CLI
+├── ocr_core.py           # 核心 OCR 邏輯、OCRConfig、OCRProcessor
+├── ocr_engine.py         # CLI 入口（互動模式 + argparse 模式）
+├── ocr_gui.py            # tkinter 圖形介面（v4.4.2 改用 worker subprocess）
+├── ocr_worker.py         # 獨立 OCR worker process（JSON Lines 輸出）
+├── worker_controller.py  # Worker 生命週期管理、crash log、control file
+├── settings_manager.py   # GUI 設定持久化
+├── run_gui.bat           # 一鍵啟動 GUI
+├── run_cli.bat           # 一鍵啟動互動式 CLI
 ├── data/
-│   └── gui_settings.json   # GUI 設定記憶（自動產生）
+│   ├── gui_settings.json           # GUI 設定記憶（自動產生）
+│   ├── checkpoints/                # 每頁斷點續跑狀態（自動產生）
+│   └── runtime_<job_id>.control.json  # 暫停／取消控制（自動產生）
 └── logs/
-    └── ocr_gui_YYYYMMDD_HHMMSS.log   # GUI 執行日誌（自動產生）
+    ├── ocr_gui_YYYYMMDD_HHMMSS.log      # GUI 執行日誌
+    ├── worker_<job_id>_YYYYMMDD.log     # Worker stderr 日誌
+    └── worker_crash_YYYYMMDD_HHMMSS.log # Worker 崩潰記錄
 ```
 
 ---
@@ -50,6 +60,10 @@ GUI 功能：
 3. 調整 OCR 設定（裝置、Zoom、預處理模式、Claude 校對）
 4. 點選「開始批次 OCR」
 5. 可隨時暫停、繼續、取消
+6. 顯示 Worker PID、裝置、最後心跳、當前頁進度、自動重試次數
+7. Worker 崩潰後 GUI 繼續存在，顯示 Windows 原生退出代碼與說明
+8. checkpoint 自動斷點續跑（同一 PDF 下次從上次失敗頁繼續）
+9. GPU crash 自動重試 → 二次失敗自動改 CPU
 
 ---
 
@@ -187,10 +201,66 @@ $env:CLAUDE_MODEL="claude-3-5-sonnet-20240620"
 
 ## 暫停／取消
 
-- **暫停**：目前頁面完成後停止（不中斷正在執行的 OCR）
+- **暫停**：目前頁面完成後停止（不中斷正在執行的 OCR），透過 control file 通知 worker
 - **繼續**：從下一頁繼續
 - **取消目前任務**：跳過剩餘頁面，進入下一個檔案
-- **全部取消**：停止整個批次
+- **全部取消**：先設 control file cancel，等待 10 秒，超時才 terminate，再等 5 秒才 kill
+
+---
+
+## Worker Process Safety（v4.4.2）
+
+從 v4.4.2 起，GUI 不再於 threading.Thread 內執行 PaddleOCR。所有 OCR 都在獨立 subprocess（`ocr_worker.py`）中執行。
+
+**架構：**
+
+```
+ocr_gui.py          只負責 UI、啟動 worker、讀取 JSON Lines
+  └─ subprocess.Popen ──▶ ocr_worker.py  (PaddleOCR 在此執行)
+       stdout: JSON Lines  ──▶ WorkerController stdout_reader thread
+       stderr: worker log 檔
+```
+
+**Worker stdout 協議（每行一筆 JSON）：**
+
+```json
+{"type":"worker_started","pid":1234}
+{"type":"environment","device":"gpu","pid":1234,"python":"3.12.0"}
+{"type":"file_started","path":"...","index":1,"total":3}
+{"type":"page_progress","path":"...","page":5,"pages":25,"stage":"OCR","preprocess":"CLAHE","elapsed":12.4}
+{"type":"file_completed","path":"...","pdf":"...","txt":"...","analysis":"..."}
+{"type":"file_failed","path":"...","error":"...","traceback":"..."}
+{"type":"batch_completed","completed":2,"failed":1,"cancelled":0}
+{"type":"heartbeat","timestamp":1234567890.0}
+```
+
+**Worker crash 處理：**
+
+| Windows 退出代碼 | 說明 |
+|------|------|
+| `-1073741819` (`0xC0000005`) | 原生程式庫存取違規（CUDA/Paddle/OpenCV/PyMuPDF） |
+| `-1073740791` (`0xC0000409`) | Stack buffer overrun |
+| `-1073741502` (`0xC0000142`) | DLL 初始化失敗 |
+| `-1073741515` (`0xC0000135`) | 找不到必要 DLL |
+
+Worker 崩潰後 GUI 顯示退出代碼說明，並在 `logs/worker_crash_YYYYMMDD_HHMMSS.log` 記錄詳細資訊。
+
+**如何關閉卡住的 worker：**
+
+GUI 按「全部取消」→ 等待 10 秒 → 若未退出自動 terminate → 再等 5 秒 → 自動 kill。
+
+或手動：
+
+```powershell
+# 查 worker PID（GUI 進度區有顯示）
+taskkill /PID <PID> /F
+```
+
+**checkpoint 斷點續跑：**
+
+每頁完成後自動寫入 `data/checkpoints/.ocr_state_<hash>.json`。
+若 worker 在第 12 頁崩潰，下次執行同一 PDF 時自動從第 13 頁繼續。
+若來源 PDF 的大小或修改時間改變，checkpoint 自動失效，從頭重新處理。
 
 ---
 

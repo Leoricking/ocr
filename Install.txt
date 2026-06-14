@@ -1,5 +1,6 @@
-OCR Engine v4.4.0 安裝說明
+OCR Engine v4.4.2 安裝說明
 適用：Windows 10 / Python 3.12 / RTX 3060 / PaddleOCR 2.10.0
+更新：GUI 改用獨立 worker process，原生 CUDA 崩潰不再關閉 GUI
 
 ============================================================
 最短安裝流程
@@ -79,3 +80,31 @@ GPU Compute Capability: 8.6
 CUDA Runtime: 11.8
 cuDNN: 8.9
 測試結果: GPU_RUNTIME_OK [1, 8, 62, 62]
+
+============================================================
+Worker Process Safety（v4.4.2 新功能）
+============================================================
+
+GUI 從 v4.4.2 起使用獨立 subprocess 執行 PaddleOCR：
+
+  ocr_gui.py ──Popen──▶ ocr_worker.py
+
+優點：
+- CUDA / Paddle 原生崩潰（access violation）不再關閉 GUI
+- GUI 保持開啟，顯示 Windows 退出代碼說明
+- 每頁寫入 checkpoint，支援斷點續跑
+- GPU crash 自動重試，二次失敗自動改 CPU
+
+Worker 日誌位置：
+  logs\worker_<job_id>_YYYYMMDD.log
+  logs\worker_crash_YYYYMMDD_HHMMSS.log
+
+Checkpoint 位置：
+  data\checkpoints\.ocr_state_<hash>.json
+
+若 worker 卡住無回應（GUI 顯示「Worker 可能無回應」）：
+  1. 按 GUI「全部取消」（等待 10 秒後自動 terminate/kill）
+  2. 或手動：taskkill /PID <Worker PID> /F
+
+CLI（python .\ocr_engine.py）仍使用原本的 in-process 穩定模式。
+GUI 才使用 worker process isolation。
