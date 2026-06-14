@@ -9,8 +9,10 @@ import time
 import subprocess
 import datetime
 import traceback
+import uuid
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
+from worker_controller import WorkerController, describe_windows_exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -140,10 +142,18 @@ class OCRGuiApp:
         self._configure_fonts_and_styles()
 
         # Threading primitives
-        self._pause_event = threading.Event()   # set = paused
-        self._cancel_event = threading.Event()
-        self._worker_thread = None
         self._task_queue = queue.Queue()
+
+        # Worker subprocess state
+        self._wc: WorkerController = None
+        self._pending_files: list = []
+        self._completed_file_count: int = 0
+        self._crash_count: int = 0
+        self._gpu_fallback_active: bool = False
+
+        # Worker settings vars (created early so _build_settings_inner can reference them)
+        self._var_auto_retry = tk.BooleanVar(value=True)
+        self._var_gpu_fallback = tk.BooleanVar(value=True)
 
         # State
         self._batch_items = {}   # file_path -> {index, pages, status, progress, avg_sec, out_pdf, out_txt, out_analysis}
@@ -556,6 +566,19 @@ class OCRGuiApp:
         )
         conf_scale.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
 
+        # ---- 7. Worker 設定 ----
+        worker_frm = ttk.LabelFrame(parent, text="Worker 設定", padding=8)
+        worker_frm.grid(row=row, column=0, sticky="ew", padx=4, pady=6)
+        worker_frm.columnconfigure(0, weight=1)
+        row += 1
+
+        ttk.Checkbutton(
+            worker_frm, text="Worker 崩潰後自動重試", variable=self._var_auto_retry
+        ).grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Checkbutton(
+            worker_frm, text="GPU 重複崩潰後自動回退 CPU", variable=self._var_gpu_fallback
+        ).grid(row=1, column=0, sticky="w", pady=3)
+
         # ---- Bottom: Reset defaults ----
         ttk.Button(parent, text="恢復預設設定", command=self._reset_defaults).grid(
             row=row, column=0, sticky="ew", padx=4, pady=(0, 4)
@@ -641,6 +664,11 @@ class OCRGuiApp:
         self._lbl_overall_info = ttk.Label(frm, text="")
         self._lbl_overall_info.grid(row=5, column=0, columnspan=3, sticky="w")
 
+        # Worker status row
+        ttk.Label(frm, text="Worker：").grid(row=6, column=0, sticky="w", pady=(4, 0))
+        self._lbl_worker_info = ttk.Label(frm, text="—")
+        self._lbl_worker_info.grid(row=6, column=1, columnspan=2, sticky="w", pady=(4, 0))
+
     def _build_log_section(self):
         log_frm = ttk.LabelFrame(self.root, text="執行日誌", padding=4)
         log_frm.grid(row=3, column=0, sticky="ew", padx=8, pady=2)
@@ -721,6 +749,8 @@ class OCRGuiApp:
         conf = s.get("confidence_threshold", 0.70)
         self._var_conf.set(conf)
         self._lbl_conf_val.config(text=f"{conf:.2f}")
+        self._var_auto_retry.set(s.get("worker_auto_retry", True))
+        self._var_gpu_fallback.set(s.get("worker_gpu_fallback", True))
 
     def _collect_settings(self) -> dict:
         s = dict(self._settings)
@@ -740,6 +770,8 @@ class OCRGuiApp:
         s["overwrite"] = self._var_overwrite.get()
         s["skip_existing"] = self._var_skip_existing.get()
         s["confidence_threshold"] = round(self._var_conf.get(), 2)
+        s["worker_auto_retry"] = self._var_auto_retry.get()
+        s["worker_gpu_fallback"] = self._var_gpu_fallback.get()
         try:
             s["window_geometry"] = self.root.geometry()
         except Exception:
@@ -1044,29 +1076,6 @@ class OCRGuiApp:
     # -----------------------------------------------------------------------
     # Main OCR batch
     # -----------------------------------------------------------------------
-    def _build_ocr_config(self):
-        _ensure_ocr_core()
-        s = self._collect_settings()
-        return _OCRConfig(
-            input_path=self._var_input.get().strip(),
-            output_path=self._var_output.get().strip(),
-            device=self._var_device.get(),
-            enable_claude=self._var_claude.get(),
-            recursive=self._var_recursive.get(),
-            overwrite=self._var_overwrite.get(),
-            skip_existing=self._var_skip_existing.get() and not self._var_overwrite.get(),
-            zoom=int(self._var_zoom.get()),
-            preprocess_mode=PREPROCESS_LABELS.get(self._var_preprocess.get(), "auto"),
-            output_pdf=self._var_out_pdf.get(),
-            output_txt=self._var_out_txt.get(),
-            output_analysis=self._var_out_analysis.get(),
-            output_verify_log=self._var_out_verify.get(),
-            confidence_threshold=round(self._var_conf.get(), 2),
-            preserve_relative_structure=self._var_preserve.get(),
-            claude_model=self._var_claude_model.get().strip(),
-            batch_failure_continue=True,
-        )
-
     def _start_batch(self):
         if self._running:
             messagebox.showinfo("提示", "批次作業正在執行中。")
@@ -1091,7 +1100,6 @@ class OCRGuiApp:
             if self._batch_items[p]["status"] in ("等待", "失敗", "已取消")
         ]
         if not pending:
-            # If batch list is empty, populate from input path
             if not self._batch_order:
                 if os.path.isfile(input_path):
                     self._add_files_to_batch([input_path])
@@ -1105,97 +1113,229 @@ class OCRGuiApp:
                 messagebox.showinfo("提示", "沒有待處理的 PDF。")
                 return
 
-        self._cancel_event.clear()
-        self._pause_event.clear()
+        self._pending_files = pending
+        self._completed_file_count = 0
+        self._crash_count = 0
+        self._gpu_fallback_active = False
         self._running = True
         self._set_running_buttons(True)
+        self._lbl_worker_info.config(text="初始化中…")
+        self._launch_worker(pending)
 
-        self._worker_thread = threading.Thread(target=self._worker_main, daemon=True)
-        self._worker_thread.start()
+    def _launch_worker(self, files: list):
+        """Build job dict and start a WorkerController subprocess."""
+        s = self._collect_settings()
+        device = "cpu" if self._gpu_fallback_active else s.get("device", "gpu")
+        cfg = {
+            "input_path":  s.get("last_input_path", ""),
+            "output_path": s.get("last_output_path", ""),
+            "device":      device,
+            "enable_claude": s.get("enable_claude", False),
+            "recursive":   s.get("recursive", False),
+            "overwrite":   s.get("overwrite", False),
+            "skip_existing": s.get("skip_existing", True) and not s.get("overwrite", False),
+            "zoom":        int(s.get("zoom", 3)),
+            "preprocess_mode": s.get("preprocess_mode", "auto"),
+            "output_pdf":  s.get("output_pdf", True),
+            "output_txt":  s.get("output_txt", True),
+            "output_analysis": s.get("output_analysis", True),
+            "output_verify_log": s.get("output_verify_log", True),
+            "confidence_threshold": round(float(s.get("confidence_threshold", 0.70)), 2),
+            "preserve_relative_structure": s.get("preserve_relative_structure", True),
+            "claude_model": s.get("claude_model", ""),
+            "batch_failure_continue": True,
+        }
+        job = {
+            "job_id":    str(uuid.uuid4())[:8],
+            "config":    cfg,
+            "pdf_files": files,
+            "resume_from_checkpoint": True,
+        }
+        self._wc = WorkerController(self._task_queue)
+        ok = self._wc.start(job)
+        if not ok:
+            self._append_log("[Worker] 無法啟動 Worker 子程序。")
+            self._running = False
+            self._set_running_buttons(False)
+            self._lbl_worker_info.config(text="啟動失敗")
+            return
+        mode_str = "CPU" if device == "cpu" else "GPU"
+        self._lbl_worker_info.config(text=f"初始化中…  裝置: {mode_str}")
+        self._append_log(f"[Worker] 子程序已啟動，裝置: {mode_str}，{len(files)} 個檔案")
 
-    def _worker_main(self):
-        try:
-            _ensure_ocr_core()
-            config = self._build_ocr_config()
+    # -----------------------------------------------------------------------
+    # Worker event handler
+    # -----------------------------------------------------------------------
+    def _handle_worker_event(self, event: dict):
+        """Handle JSON events emitted by WorkerController / ocr_worker.py."""
+        etype = event.get("type", "")
 
-            pending_files = [
-                p for p in self._batch_order
-                if self._batch_items[p]["status"] in ("等待", "失敗", "已取消")
-            ]
-            file_total = len(pending_files)
+        if etype == "log":
+            self._append_log(event.get("message", ""))
 
-            self._task_queue.put(("log", f"[批次] 開始處理 {file_total} 個 PDF..."))
+        elif etype == "worker_started":
+            pid = event.get("pid", "?")
+            self._append_log(f"[Worker] 子程序已啟動，PID: {pid}")
+            self._lbl_worker_info.config(text=f"PID: {pid}  狀態: 初始化")
 
-            processor = _OCRProcessor(
-                config=config,
-                progress_callback=self._on_progress,
-                log_callback=lambda msg: self._task_queue.put(("log", msg)),
-                file_status_callback=self._on_file_status,
-                pause_event=self._pause_event,
-                cancel_event=self._cancel_event,
+        elif etype == "environment":
+            pid = event.get("pid", "?")
+            dev = event.get("device", "?").upper()
+            self._append_log(f"[Worker] 環境確認: PID={pid}，裝置={dev}")
+            self._lbl_worker_info.config(text=f"PID: {pid}  狀態: 執行中  裝置: {dev}")
+
+        elif etype == "heartbeat":
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            try:
+                base = self._lbl_worker_info.cget("text").split("  心跳:")[0]
+                self._lbl_worker_info.config(text=f"{base}  心跳: {ts}")
+            except Exception:
+                pass
+
+        elif etype == "file_started":
+            path = event.get("path", "")
+            self._update_file_status(path, "OCR 中", "")
+
+        elif etype == "file_pages":
+            path = event.get("path", "")
+            pages = event.get("pages", 0)
+            self._update_tree_pages(path, pages)
+
+        elif etype == "page_progress":
+            path = event.get("path", "")
+            page = event.get("page", 0)
+            total = event.get("pages", 0)
+            stage = event.get("stage", "")
+            avg = event.get("avg_sec_per_page", 0.0)
+            remaining = event.get("estimated_remaining", 0.0)
+            fname = os.path.basename(path)
+            self._lbl_current_file.config(text=fname)
+            if total > 0:
+                pct = int((page + 1) / total * 100)
+                self._pbar_file["value"] = pct
+            self._lbl_page_info.config(
+                text=(f"第 {page + 1}/{total} 頁  階段：{stage}  "
+                      f"平均：{avg:.2f}s/頁  剩餘：{remaining:.0f}s")
             )
-            processor.initialize_engine()
+            item = self._batch_items.get(path)
+            if item:
+                item["progress"] = f"{page + 1}/{total}"
+                item["avg_sec"] = f"{avg:.2f}"
+                self._tree_refresh_row(path)
 
-            for file_index, pdf_path in enumerate(pending_files):
-                if self._cancel_event.is_set():
-                    self._task_queue.put(("file_status", file_index, pdf_path, "已取消", ""))
-                    break
-                # Update overall progress
-                pct = int(file_index / file_total * 100) if file_total else 0
-                self._task_queue.put(("overall_progress", file_index, file_total, pct))
-                try:
-                    processor.process_pdf(pdf_path, file_index=file_index, file_total=file_total)
-                    # Record output paths
-                    out_dir = processor._resolve_output_path(pdf_path)
-                    stem = os.path.splitext(os.path.basename(pdf_path))[0]
-                    self._task_queue.put(("set_outputs", pdf_path, out_dir, stem))
-                except _OCRCancelledError:
-                    self._task_queue.put(("file_status", file_index, pdf_path, "已取消", ""))
-                    break
-                except Exception as exc:
-                    self._task_queue.put(("log", f"[錯誤] {os.path.basename(pdf_path)}：{exc}"))
-                    self._task_queue.put(("file_status", file_index, pdf_path, "失敗", str(exc)))
-                    if not config.batch_failure_continue:
-                        break
+        elif etype == "file_completed":
+            path = event.get("path", "")
+            self._update_file_status(path, "完成", "")
+            self._completed_file_count += 1
+            item = self._batch_items.get(path)
+            if item:
+                item["out_pdf"] = event.get("pdf", "")
+                item["out_txt"] = event.get("txt", "")
+                item["out_analysis"] = event.get("analysis", "")
+                self._tree_refresh_row(path)
+            total = len(self._pending_files)
+            pct = int(self._completed_file_count / total * 100) if total else 100
+            self._pbar_overall["value"] = pct
+            self._lbl_overall_info.config(
+                text=f"{self._completed_file_count}/{total} 個檔案  ({pct}%)"
+            )
 
-            self._task_queue.put(("overall_progress", file_total, file_total, 100))
-            self._task_queue.put(("log", "[批次] 全部完成。"))
-        except Exception as exc:
-            self._task_queue.put(("log", f"[錯誤] 工作執行緒異常：{exc}\n{traceback.format_exc()}"))
-        finally:
-            self._task_queue.put(("done",))
+        elif etype == "file_failed":
+            path = event.get("path", "")
+            error = event.get("error", "")
+            self._update_file_status(path, "失敗", error[:120])
+            self._completed_file_count += 1
 
-    def _on_progress(self, prog):
-        self._task_queue.put(("progress", prog))
+        elif etype == "file_cancelled":
+            path = event.get("path", "")
+            self._update_file_status(path, "已取消", "")
 
-    def _on_file_status(self, file_index, file_path, status, extra_info):
-        self._task_queue.put(("file_status", file_index, file_path, status, extra_info))
+        elif etype == "batch_completed":
+            c = event.get("completed", 0)
+            f = event.get("failed", 0)
+            cn = event.get("cancelled", 0)
+            self._append_log(f"[Worker] 批次完成：{c} 完成，{f} 失敗，{cn} 取消")
+
+        elif etype == "worker_exited":
+            rc = event.get("returncode", 0)
+            desc = event.get("description", str(rc))
+            last_page = event.get("last_completed_page", -1)
+            crash_log = event.get("crash_log", "")
+            self._append_log(f"[Worker] 子程序結束，exit code: {desc}")
+
+            if rc != 0:
+                remaining = self._pending_files[self._completed_file_count:]
+                if crash_log:
+                    self._append_log(f"[Worker] Crash log: {crash_log}")
+                self._append_log(
+                    f"[Worker] 最後完成頁: {last_page}，剩餘 {len(remaining)} 個檔案"
+                )
+                if remaining and self._var_auto_retry.get():
+                    self._crash_count += 1
+                    if (self._var_gpu_fallback.get() and
+                            not self._gpu_fallback_active and
+                            self._var_device.get() == "gpu" and
+                            self._crash_count >= 2):
+                        self._gpu_fallback_active = True
+                        self._append_log(
+                            f"[Worker] GPU 已連續崩潰 {self._crash_count} 次，自動回退 CPU。"
+                        )
+                    self._append_log(
+                        f"[Worker] 第 {self._crash_count} 次自動重試，"
+                        f"{len(remaining)} 個檔案..."
+                    )
+                    self.root.after(2000, lambda r=remaining: self._launch_worker(r))
+                else:
+                    for p in (self._pending_files[self._completed_file_count:]):
+                        self._update_file_status(p, "失敗", "Worker 崩潰")
+                    self._on_worker_done()
+            else:
+                self._on_worker_done()
+
+        elif etype == "paused":
+            self._append_log("[Worker] 已暫停。")
+
+        elif etype == "resumed":
+            self._append_log("[Worker] 已繼續。")
+
+        elif etype == "controller_error":
+            err = event.get("error", "")
+            self._append_log(f"[Worker] 控制器錯誤：{err}")
+            self._on_worker_done()
+
+    def _on_worker_done(self):
+        self._running = False
+        self._set_running_buttons(False)
+        self._pbar_overall["value"] = 100
+        retry_info = f"（崩潰重試 {self._crash_count} 次）" if self._crash_count else ""
+        self._lbl_worker_info.config(text=f"正常完成{retry_info}")
+        self._append_log("[批次] 工作執行緒結束。")
 
     # -----------------------------------------------------------------------
     # Pause / Cancel
     # -----------------------------------------------------------------------
     def _pause_batch(self):
-        if self._running and not self._pause_event.is_set():
-            self._pause_event.set()
+        if self._running and self._wc and self._wc.is_running():
+            self._wc.pause()
             self._btn_pause.config(state="disabled")
             self._btn_resume.config(state="normal")
-            self._append_log("[暫停] 已暫停，當前頁面完成後停止。")
+            self._append_log("[暫停] 已傳送暫停指令。")
 
     def _resume_batch(self):
-        if self._pause_event.is_set():
-            self._pause_event.clear()
+        if self._wc:
+            self._wc.resume()
             self._btn_pause.config(state="normal")
             self._btn_resume.config(state="disabled")
             self._append_log("[繼續] 已繼續。")
 
     def _cancel_current(self):
-        if self._running:
-            self._cancel_event.set()
+        if self._running and self._wc:
+            self._wc.cancel()
             self._append_log("[取消] 已傳送取消訊號。")
 
     def _cancel_all(self):
-        self._cancel_event.set()
-        self._pause_event.clear()
+        if self._wc:
+            self._wc.cancel()
         self._append_log("[取消] 已傳送全部取消訊號。")
 
     def _set_running_buttons(self, running: bool):
@@ -1218,32 +1358,19 @@ class OCRGuiApp:
         try:
             while True:
                 msg = self._task_queue.get_nowait()
-                self._handle_message(msg)
+                if isinstance(msg, dict):
+                    self._handle_worker_event(msg)
+                else:
+                    self._handle_message(msg)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
 
     def _handle_message(self, msg):
+        """Handle internal (non-worker) queue messages."""
         kind = msg[0]
         if kind == "log":
             self._append_log(msg[1])
-        elif kind == "progress":
-            self._handle_progress(msg[1])
-        elif kind == "file_status":
-            _, file_index, file_path, status, extra_info = msg
-            self._update_file_status(file_path, status, extra_info)
-        elif kind == "overall_progress":
-            _, done, total, pct = msg
-            self._pbar_overall["value"] = pct
-            self._lbl_overall_info.config(text=f"{done}/{total} 個檔案  ({pct}%)")
-        elif kind == "set_outputs":
-            _, pdf_path, out_dir, stem = msg
-            item = self._batch_items.get(pdf_path)
-            if item:
-                item["out_pdf"] = os.path.join(out_dir, stem + "_OCR.pdf")
-                item["out_txt"] = os.path.join(out_dir, stem + "_OCR.txt")
-                item["out_analysis"] = os.path.join(out_dir, stem + "_OCR_analysis.txt")
-                self._tree_refresh_row(pdf_path)
         elif kind == "gpu_test_result":
             _, ok, detail = msg
             if ok:
@@ -1258,33 +1385,6 @@ class OCRGuiApp:
                 self._append_log("[API] Claude API Key 驗證成功。")
             else:
                 self._append_log("[API] Claude API Key 驗證失敗，請檢查 CLAUDE_API_KEY 環境變數。")
-        elif kind == "done":
-            self._running = False
-            self._pause_event.clear()
-            self._cancel_event.clear()
-            self._set_running_buttons(False)
-            self._append_log("[批次] 工作執行緒結束。")
-
-    def _handle_progress(self, prog):
-        from ocr_core import OCRProgress
-        fname = os.path.basename(prog.file_path)
-        self._lbl_current_file.config(text=fname)
-        if prog.page_total > 0:
-            pct = int((prog.page_index + 1) / prog.page_total * 100)
-            self._pbar_file["value"] = pct
-        self._lbl_page_info.config(
-            text=(
-                f"第 {prog.page_index + 1}/{prog.page_total} 頁  "
-                f"階段：{prog.stage}  "
-                f"平均：{prog.average_seconds_per_page:.2f}s/頁  "
-                f"剩餘：{prog.estimated_remaining_seconds:.0f}s"
-            )
-        )
-        item = self._batch_items.get(prog.file_path)
-        if item:
-            item["progress"] = f"{prog.page_index + 1}/{prog.page_total}"
-            item["avg_sec"] = f"{prog.average_seconds_per_page:.2f}"
-            self._tree_refresh_row(prog.file_path)
 
     def _update_file_status(self, file_path: str, status: str, extra_info: str):
         item = self._batch_items.get(file_path)
@@ -1347,8 +1447,8 @@ class OCRGuiApp:
                 "批次作業正在執行中，確定要關閉嗎？\n（OCR 工作將被取消）"
             ):
                 return
-            self._cancel_event.set()
-            self._pause_event.clear()
+            if self._wc:
+                self._wc.force_stop()
             time.sleep(0.5)
 
         # Save settings

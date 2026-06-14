@@ -34,6 +34,8 @@ DEFAULTS = {
     "left_panel_width": 0,
     "log_panel_height": 0,
     "batch_failure_strategy": "continue",  # "continue" or "stop"
+    "worker_auto_retry": True,
+    "worker_gpu_fallback": True,
 }
 
 
