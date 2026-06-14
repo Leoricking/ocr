@@ -1,0 +1,20 @@
+# OCR GPU 穩定環境：Python 3.12 / Windows / RTX 3060
+numpy==1.26.4
+pillow==10.4.0
+opencv-python==4.10.0.84
+opencv-contrib-python==4.10.0.84
+opencv-python-headless==4.10.0.84
+tifffile==2024.9.20
+scipy==1.13.1
+scikit-image==0.24.0
+scikit-learn==1.5.2
+albucore==0.0.16
+albumentations==1.4.11
+paddleocr==2.10.0
+nvidia-cublas-cu11==11.11.3.6
+nvidia-cuda-runtime-cu11==11.8.89
+nvidia-cudnn-cu11==8.9.5.29
+PyMuPDF==1.24.13
+tqdm==4.67.1
+anthropic>=0.40,<1
+packaging>=24,<27

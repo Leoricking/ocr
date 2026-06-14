@@ -1,0 +1,55 @@
+# Python cache
+
+**pycache**/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+
+.venv/
+venv/
+env/
+
+# Local IDE / AI settings
+
+.claude/
+.vscode/
+.idea/
+
+# Local environment snapshots
+
+requirements-working.txt
+
+# External installers and binaries
+
+VC_redist.x64.exe
+*.exe
+
+# Private or copyrighted test material
+
+test/
+tests/input/
+tests/output/
+
+# OCR generated output
+
+output*_OCRpdf
+*_OCR.txt
+ocr_process_log.txt
+erify_log.txt
+
+# Temporary file
+
+*.tmp
+*.temp
+~$*
+.DS/
+.vs_Store
+Thumbs.db
+
+# Secrets and environment variables
+
+.env
+.env.*
+!.env.example
+
