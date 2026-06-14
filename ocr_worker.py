@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-ocr_worker.py — OCR Engine v4.4.2 standalone worker process.
+ocr_worker.py — OCR Engine v4.5.0 standalone worker process.
 Run by ocr_gui.py via subprocess.Popen. Outputs JSON Lines to stdout.
 """
+
+import os as _os, sys as _sys
+_os.environ["PYTHONUTF8"] = "1"
+_os.environ["PYTHONIOENCODING"] = "utf-8"
+if hasattr(_sys.stdout, "reconfigure"):
+    _sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace", line_buffering=True)
+if hasattr(_sys.stderr, "reconfigure"):
+    _sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace", line_buffering=True)
 
 import os
 import sys
@@ -11,8 +19,11 @@ import gc
 import time
 import argparse
 import traceback
+import contextlib
 from datetime import datetime
 from pathlib import Path
+
+JSON_STDOUT = sys.stdout   # save reference before any redirect
 
 
 # ---------------------------------------------------------------------------
@@ -21,11 +32,21 @@ from pathlib import Path
 
 def emit(event: dict):
     """Output a single JSON event to stdout."""
-    print(json.dumps(event, ensure_ascii=False), flush=True)
+    print(json.dumps(event, ensure_ascii=False), file=JSON_STDOUT, flush=True)
+
+
+def _check_encoding(event: dict):
+    """Warn if any string value contains UTF-8 replacement characters."""
+    for v in event.values():
+        if isinstance(v, str) and "\ufffd" in v:
+            emit({"type": "log", "message": f"[encoding] replacement char in {list(event.keys())}"})
+            break
 
 
 def emit_log(message: str):
-    emit({"type": "log", "message": message})
+    ev = {"type": "log", "message": message}
+    _check_encoding(ev)
+    emit(ev)
 
 
 def emit_heartbeat():
@@ -148,13 +169,17 @@ def process_pdf_with_checkpoint(
 
     completed_set = set(cp["completed_pages"])
 
-    emit({"type": "file_started", "path": pdf_path, "index": file_index, "total": file_total})
+    ev_started = {"type": "file_started", "path": pdf_path, "index": file_index, "total": file_total}
+    _check_encoding(ev_started)
+    emit(ev_started)
 
     doc = fitz.open(pdf_path)
     pages = list(doc)
     total_pages = len(pages)
 
-    emit({"type": "file_pages", "path": pdf_path, "pages": total_pages})
+    ev_pages = {"type": "file_pages", "path": pdf_path, "pages": total_pages}
+    _check_encoding(ev_pages)
+    emit(ev_pages)
 
     page_times = []
     t_file_start = time.perf_counter()
@@ -471,17 +496,18 @@ def main():
         "device": "gpu" if use_gpu else "cpu",
     })
 
-    # Initialize PaddleOCR once
+    # Initialize PaddleOCR once — redirect stdout so Paddle warnings don't pollute JSON
     try:
-        ocr_instance = PaddleOCR(
-            lang="chinese_cht",
-            use_gpu=use_gpu,
-            use_angle_cls=True,
-            det_db_thresh=0.2,
-            det_db_unclip_ratio=1.8,
-            show_log=False,
-            enable_mkldnn=not use_gpu,
-        )
+        with contextlib.redirect_stdout(sys.stderr):
+            ocr_instance = PaddleOCR(
+                lang="chinese_cht",
+                use_gpu=use_gpu,
+                use_angle_cls=True,
+                det_db_thresh=0.2,
+                det_db_unclip_ratio=1.8,
+                show_log=False,
+                enable_mkldnn=not use_gpu,
+            )
     except Exception as exc:
         emit({"type": "log", "message": f"[Worker] PaddleOCR 初始化失敗: {exc}"})
         emit({"type": "batch_completed", "completed": 0, "failed": 0, "cancelled": 0})

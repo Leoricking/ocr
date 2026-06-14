@@ -162,7 +162,7 @@ class TestSettingsManager(unittest.TestCase):
             result = sm.load()
             self.assertEqual(result["zoom"], 3)
             self.assertEqual(result["device"], "gpu")
-            self.assertFalse(result["enable_claude"])
+            self.assertEqual(result["proofreading_engine"], "none")
 
     def test_save_and_reload(self):
         with tempfile.TemporaryDirectory() as d:
@@ -182,13 +182,13 @@ class TestSettingsManager(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             sm = self._make_sm(d)
             settings = sm.load()
-            settings["claude_model"] = "claude-test"
+            settings["proofreading_model"] = "llama3-test"
             sm.save(settings)
             path = Path(d) / "data" / "test_settings.json"
             self.assertTrue(path.exists())
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            self.assertEqual(data["claude_model"], "claude-test")
+            self.assertEqual(data["proofreading_model"], "llama3-test")
 
     def test_corrupt_file_recovery(self):
         with tempfile.TemporaryDirectory() as d:

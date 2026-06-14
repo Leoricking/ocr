@@ -1,4 +1,4 @@
-# settings_manager.py — GUI settings persistence for OCR Engine v4.4.0
+# settings_manager.py — GUI settings persistence for OCR Engine v4.5.0
 # Settings stored at: C:\Users\Rossi\Documents\Claude\OCR\data\gui_settings.json
 
 import json
@@ -12,11 +12,13 @@ DEFAULTS = {
     "version": 1,
     "last_input_path": "",
     "last_output_path": "",
-    "input_mode": "folder",          # "file" or "folder"
+    "input_mode": "folder",
     "recursive": False,
     "device": "gpu",
-    "enable_claude": False,
-    "claude_model": "",
+    "proofreading_engine": "none",
+    "proofreading_model": "",
+    "proofreading_level": "conservative",
+    "proofreading_base_url": "http://127.0.0.1:11434",
     "zoom": 3,
     "preprocess_mode": "auto",
     "output_pdf": True,
@@ -25,17 +27,15 @@ DEFAULTS = {
     "output_verify_log": True,
     "overwrite": False,
     "skip_existing": True,
-    "confidence_threshold": 0.7,
+    "confidence_threshold": 0.70,
     "preserve_relative_structure": True,
-    "window_geometry": "1280x820+100+80",
+    "exclude_ocr_output": True,
+    "worker_auto_retry": True,
+    "worker_cpu_fallback": True,
+    "window_geometry": "",
     "window_state": "normal",
     "horizontal_sash_position": 0,
-    "vertical_sash_position": 0,
-    "left_panel_width": 0,
-    "log_panel_height": 0,
-    "batch_failure_strategy": "continue",  # "continue" or "stop"
-    "worker_auto_retry": True,
-    "worker_gpu_fallback": True,
+    "batch_failure_strategy": "continue",
 }
 
 

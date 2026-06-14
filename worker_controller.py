@@ -91,7 +91,7 @@ class WorkerController:
         job["control_file"] = self._control_file
         job["checkpoint_dir"] = os.path.join(DATA_DIR, "checkpoints")
         job_file = os.path.join(DATA_DIR, f"job_{self._job_id}.json")
-        with open(job_file, "w", encoding="utf-8") as f:
+        with open(job_file, "w", encoding="utf-8", newline="\n") as f:
             json.dump(job, f, ensure_ascii=False, indent=2)
 
         cmd = [
@@ -105,9 +105,14 @@ class WorkerController:
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NO_WINDOW
 
+        child_env = os.environ.copy()
+        child_env["PYTHONUTF8"] = "1"
+        child_env["PYTHONIOENCODING"] = "utf-8"
+
         try:
             self._process = subprocess.Popen(
                 cmd,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -115,7 +120,7 @@ class WorkerController:
                 errors="replace",
                 bufsize=1,
                 cwd=PROJECT_DIR,
-                env=os.environ.copy(),
+                env=child_env,
                 creationflags=creationflags,
             )
         except Exception as exc:
@@ -147,7 +152,7 @@ class WorkerController:
     def _write_control(self, pause: bool, cancel: bool):
         tmp = self._control_file + ".tmp"
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"pause": pause, "cancel": cancel}, f)
                 f.flush()
                 os.fsync(f.fileno())
@@ -183,6 +188,43 @@ class WorkerController:
             self._process.kill()
         except Exception:
             pass
+
+    def cleanup_process(self, timeout_graceful=10, timeout_kill=5):
+        """Fully clean up process and reader threads after completion."""
+        if not self._process:
+            return
+        # If still running, attempt graceful stop
+        if self._process.poll() is None:
+            try:
+                self._process.wait(timeout=timeout_graceful)
+            except subprocess.TimeoutExpired:
+                pass
+        if self._process.poll() is None:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=timeout_kill)
+            except Exception:
+                pass
+        if self._process.poll() is None:
+            try:
+                self._process.kill()
+            except Exception:
+                pass
+        # Close pipes
+        for pipe in (self._process.stdin, self._process.stdout, self._process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+        # Join reader threads
+        for thread_attr in ("_stdout_thread", "_stderr_thread"):
+            t = getattr(self, thread_attr, None)
+            if t is not None and t.is_alive():
+                t.join(timeout=5)
+        self._process = None
+        self._stdout_thread = None
+        self._stderr_thread = None
 
     # ------------------------------------------------------------------ #
     def _read_stdout(self):
@@ -226,7 +268,7 @@ class WorkerController:
             crash_log = os.path.join(LOGS_DIR, f"worker_crash_{ts}.log")
             self._crash_log_path = crash_log
             try:
-                with open(crash_log, "w", encoding="utf-8") as f:
+                with open(crash_log, "w", encoding="utf-8", newline="\n") as f:
                     f.write(f"Worker exit code: {returncode}\n")
                     f.write(f"Description: {describe_windows_exit_code(returncode)}\n")
                     f.write(f"Last completed page: {self._last_completed_page}\n")
