@@ -1,0 +1,81 @@
+OCR Engine v4.4.0 安裝說明
+適用：Windows 10 / Python 3.12 / RTX 3060 / PaddleOCR 2.10.0
+
+============================================================
+最短安裝流程
+============================================================
+
+1. 開啟 PowerShell，切換到 OCR 專案資料夾：
+
+   cd "C:\Users\Rossi\Documents\Claude\OCR"
+
+2. 執行一鍵安裝：
+
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\install_ocr_gpu.ps1"
+
+3. 安裝完成後驗證：
+
+   python -m pip check
+   python -c "from paddleocr import PaddleOCR; print('PaddleOCR OK')"
+   python -c "import paddle; paddle.set_device('gpu:0'); x=paddle.randn([1,3,64,64]); w=paddle.randn([8,3,3,3]); y=paddle.nn.functional.conv2d(x,w); print('GPU OK:', list(y.shape))"
+
+4. 啟動（擇一）：
+
+   GUI：  python .\ocr_gui.py    或雙擊 run_gui.bat
+   CLI：  python .\ocr_engine.py 或雙擊 run_cli.bat
+
+============================================================
+安裝程式自動完成
+============================================================
+
+1.  確認 Python 3.12
+2.  更新 pip / setuptools / wheel
+3.  移除衝突版本（OpenCV、Paddle、NumPy、Pillow、Albumentations）
+4.  安裝 PaddlePaddle GPU 2.6.1
+5.  安裝 PaddleOCR 2.10.0
+6.  安裝 OpenCV 4.10.0.84
+7.  固定 NumPy 1.26.4
+8.  固定 Pillow 10.4.0
+9.  固定 Albumentations 1.4.11
+10. 固定 Albucore 0.0.16
+11. 固定 tifffile 2024.9.20
+12. 安裝 cuDNN 8.9.5.29
+13. 檢查 cudnn_ops_infer64_8.dll
+14. GPU Conv2D 實際測試
+15. 產生 requirements-working.txt
+
+============================================================
+Claude AI 校對（可選）
+============================================================
+
+設定 API Key（僅當前 session）：
+
+   $env:CLAUDE_API_KEY="sk-ant-..."
+
+指定模型（可選）：
+
+   $env:CLAUDE_MODEL="claude-3-5-sonnet-20240620"
+
+============================================================
+固定版本（禁止單獨升級）
+============================================================
+
+numpy             1.26.4    ← NumPy 2.x 衝突
+pillow            10.4.0    ← Pillow 11.x 衝突
+opencv-python     4.10.0.84
+albumentations    1.4.11
+albucore          0.0.16
+paddleocr         2.10.0    ← PaddleOCR 3.x API 不相容
+paddlepaddle-gpu  2.6.1     ← 需配合 cuDNN 8.x
+nvidia-cudnn-cu11 8.9.5.29
+
+不要執行：pip install --upgrade <以上任一套件>
+
+============================================================
+GPU 已確認環境
+============================================================
+
+GPU Compute Capability: 8.6
+CUDA Runtime: 11.8
+cuDNN: 8.9
+測試結果: GPU_RUNTIME_OK [1, 8, 62, 62]

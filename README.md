@@ -1,598 +1,267 @@
-# OCR Engine v4.2.0 老舊掃描增強版
+# OCR Engine v4.4.0 — PDF 搜尋化與品質分析系統
 
-OCR Engine 是一套以 **PaddleOCR + PyMuPDF + OpenCV** 為核心的 PDF 搜尋化工具，主要用來把原本無法搜尋、無法複製文字的掃描 PDF，轉換成：
+## 專案功能
 
-- 可搜尋文字的 OCR PDF
-- 對應頁碼的純文字檔
-- OCR 校正紀錄
-- 可選擇使用 Claude API 進一步修正錯字、術語與公式
+將掃描版 PDF 轉換為可搜尋的文字型 PDF，同時輸出純文字與品質分析報告。
 
-本專案特別針對以下文件最佳化：
-
-- 泛黃、低對比、模糊的舊書與講義
-- 帶印章、手寫旁註、掃描陰影的 PDF
-- 繁體中文書籍與雜誌
-- 台大物理、電磁學、電機工程講義
-- 財經、投資、基金與週刊類文件
-- 含英文、數字、公式與頁碼的混合內容
+- PaddleOCR（繁體中文）三路預處理候選自動選最佳
+- 財經雜誌雙欄閱讀順序自動修正
+- Claude AI 批次校對（可選）
+- 固定式亂碼修正規則
+- 品質分析報告（低置信度、亂碼標記、公式偵測）
+- GPU 自動偵測與安全回退 CPU
+- Nougat / Surya 可選引擎安全停用
 
 ---
 
-## 專案目的
+## 檔案架構
 
-大量掃描 PDF 通常只有圖片，無法直接搜尋、複製或建立知識庫。
-
-OCR Engine 的目的，是把這些文件轉成可搜尋、可整理、可再利用的資料，適合用於：
-
-- 建立個人電子書搜尋庫
-- 將舊講義、雜誌與書籍轉成可全文搜尋 PDF
-- 匯出純文字後交給 AI 摘要、分類或建立知識庫
-- 比對 OCR 原始結果與校正結果
-- 批次處理資料夾內多份 PDF
-- 保存原始頁面外觀，同時加入透明文字層
-
----
-
-## 主要功能
-
-### 1. PDF 批次 OCR
-
-來源路徑可以是：
-
-- 單一 PDF 檔案
-- 包含多份 PDF 的資料夾
-
-若輸入資料夾，程式會自動依序處理其中所有 `.pdf` 檔案。
-
-### 2. 三路影像預處理
-
-每一頁會建立三種 OCR 候選：
-
-1. 原始影像
-2. CLAHE 對比增強
-3. 自適應二值化
-
-程式會依照平均置信度、有效文字量與噪聲比例，自動選擇較佳結果。
-
-這對泛黃紙張、淡字、低對比、掃描陰影與輕微模糊特別有幫助。
-
-### 3. 保留原 PDF 外觀
-
-程式不會重新排版整份 PDF。
-
-原始頁面影像會保留，辨識文字會以透明文字層嵌入原頁面，因此可：
-
-- 在 PDF 閱讀器中搜尋文字
-- 複製文字
-- 保持原始版面、圖片與頁面尺寸
-- 避免 OCR 後版面重排
-
-### 4. 輸出純文字檔
-
-每份 PDF 除了產生 `_OCR.pdf`，還會同步產生 `_OCR.txt`。
-
-文字檔會保留頁碼分隔，例如：
-
-```text
-=== PAGE 1 ===
-第一頁文字內容
-
-=== PAGE 2 ===
-第二頁文字內容
 ```
-
-可用於：
-
-- 全文搜尋
-- AI 摘要
-- 知識庫匯入
-- 文件分類
-- OCR 品質比對
-
-### 5. GPU / CPU 雙模式
-
-啟動後可選擇：
-
-```text
-1: GPU[RTX 3060]
-2: CPU
-```
-
-GPU 模式會先檢查：
-
-- CUDA Runtime
-- cuDNN 8
-- cuBLAS Lt
-- PaddlePaddle GPU
-- 實際 Conv2D GPU 運算
-
-GPU 自我測試在獨立子程序中執行。若 CUDA、cuDNN 或 DLL 發生問題，主程式不會直接崩潰，而會自動回退 CPU。
-
-### 6. GPU DLL 自動載入
-
-Windows 啟動時會自動尋找並加入：
-
-- `nvidia/cublas/bin`
-- `nvidia/cudnn/bin`
-- `nvidia/cuda_runtime/bin`
-- Paddle 相關 DLL 路徑
-- CUDA 11.8 安裝路徑
-
-主要用來避免：
-
-- 找不到 `cudnn_ops_infer64_8.dll`
-- 找不到 `cublasLt64_11.dll`
-- Paddle GPU 原生崩潰
-- Python 直接停止運作
-
-### 7. 可選 Claude AI 校對
-
-Claude 校對不是必要功能。
-
-只做本地 OCR 時，在啟動畫面選：
-
-```text
-是否啟用 Claude 自動校對？ (y/n): n
-```
-
-啟用後，程式會根據內容模式使用不同校對提示：
-
-- 一般繁體中文
-- 財經與投資內容
-- 物理、電磁學與工程內容
-- LaTeX 與公式內容
-
-AI 校對會嘗試修正：
-
-- OCR 錯字
-- 繁簡轉換問題
-- 英文拼字
-- 專業術語
-- 標點與斷句
-- 物理公式與 LaTeX
-- 財經術語與數字
-
-無法確定的內容會盡量保留原字，不應憑空生成內容。
-
-### 8. 專業錯字修正
-
-程式內建部分常見錯字，例如：
-
-```text
-白大       → 台大
-輻樹聲     → 賴樹聲
-貨格考     → 資格考
-理輪       → 理論
-梨力學     → 熱力學
-電形學     → 電磁學
-Post-Doctoe → Post-Doctor
-```
-
-這些規則在不使用 Claude API 時也會套用。
-
-### 9. 專用 OCR 引擎擴充
-
-程式支援偵測以下可選引擎：
-
-- PaddleOCR：預設與主要 OCR 引擎
-- Nougat：物理、數學與 LaTeX 文件
-- Surya OCR：財經雜誌、多欄版面
-
-未安裝 Nougat 或 Surya 時，程式會自動使用 PaddleOCR，不影響基本功能。
-
-### 10. 校正與驗證日誌
-
-每次處理會產生：
-
-```text
-verify_log.txt
-```
-
-內容會記錄：
-
-- 檔名
-- 頁碼
-- 使用引擎
-- 原始 OCR
-- 修正後文字
-- 是否使用 AI 校對
-
-方便後續核對與追蹤 OCR 品質。
-
----
-
-## 輸出結果
-
-假設來源檔案為：
-
-```text
-賴樹聲 電磁波.pdf
-```
-
-輸出資料夾會包含：
-
-```text
-賴樹聲 電磁波_OCR.pdf
-賴樹聲 電磁波_OCR.txt
-verify_log.txt
-```
-
-其中：
-
-- `_OCR.pdf`：保留原始頁面並加入透明文字層
-- `_OCR.txt`：依頁碼輸出的純文字
-- `verify_log.txt`：OCR 與校正紀錄
-
----
-
-## 系統需求
-
-建議環境：
-
-```text
-Windows 10 / 11
-Python 3.12.x
-NVIDIA RTX 3060 或其他 CUDA 11.8 相容 GPU
-PaddlePaddle GPU 2.6.1
-PaddleOCR 2.10.0
-CUDA Runtime 11.8
-cuDNN 8.9
-```
-
-沒有 NVIDIA GPU 也可以使用 CPU 模式。
-
----
-
-## 專案檔案
-
-必要檔案：
-
-```text
-ocr_engine.py
-install_ocr_gpu.ps1
-requirements-ocr-gpu.txt
-README.md
-Install OCR GPU.md
-```
-
-建議目錄：
-
-```text
 OCR/
-├─ ocr_engine.py
-├─ install_ocr_gpu.ps1
-├─ requirements-ocr-gpu.txt
-├─ README.md
-├─ Install OCR GPU.md
-├─ Demo/
-└─ Install/
+├── ocr_core.py          # 核心 OCR 邏輯、OCRConfig、OCRProcessor
+├── ocr_engine.py        # CLI 入口（互動模式 + argparse 模式）
+├── ocr_gui.py           # tkinter 圖形介面
+├── settings_manager.py  # GUI 設定持久化
+├── run_gui.bat          # 一鍵啟動 GUI
+├── run_cli.bat          # 一鍵啟動互動式 CLI
+├── data/
+│   └── gui_settings.json   # GUI 設定記憶（自動產生）
+└── logs/
+    └── ocr_gui_YYYYMMDD_HHMMSS.log   # GUI 執行日誌（自動產生）
 ```
 
 ---
 
-## 安裝方式
-
-### 方法一：使用一鍵 GPU 安裝腳本
-
-開啟 PowerShell：
+## GUI 使用方法
 
 ```powershell
-cd "C:\Users\Rossi\Documents\Claude\OCR"
+python .\ocr_gui.py
 ```
 
-執行：
+或直接雙擊：
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\install_ocr_gpu.ps1"
+```
+run_gui.bat
 ```
 
-安裝腳本會處理固定套件、PaddleOCR、PaddlePaddle GPU、CUDA Runtime、cuDNN 與 cuBLAS 相依套件。
-
-安裝完成後檢查：
-
-```powershell
-python -m pip check
-```
-
-理想結果：
-
-```text
-No broken requirements found.
-```
-
-檢查 PaddleOCR：
-
-```powershell
-python -c "from paddleocr import PaddleOCR; print('PaddleOCR import OK')"
-```
-
-檢查 GPU：
-
-```powershell
-python -c "import paddle; paddle.set_device('gpu:0'); x=paddle.randn([1,3,64,64]); w=paddle.randn([8,3,3,3]); y=paddle.nn.functional.conv2d(x,w); print('GPU/cuDNN/cuBLAS OK:', list(y.shape))"
-```
-
-### 方法二：依 requirements 安裝
-
-```powershell
-python -m pip install -r requirements-ocr-gpu.txt
-```
-
-PaddlePaddle GPU 的安裝來源可能因平台與 CUDA 版本不同，建議仍優先使用 `install_ocr_gpu.ps1`。
+GUI 功能：
+1. 設定來源 PDF 或資料夾
+2. 設定輸出資料夾
+3. 調整 OCR 設定（裝置、Zoom、預處理模式、Claude 校對）
+4. 點選「開始批次 OCR」
+5. 可隨時暫停、繼續、取消
 
 ---
 
-## 啟動方式
+## CLI 使用方法
 
-正式啟動檔名統一為：
+### 互動模式（原版行為）
 
 ```powershell
 python .\ocr_engine.py
 ```
 
-不要再使用：
+或：
 
-```text
-ocr_engine_v4.1.0.py
-ocr_engine_v4.1.1.py
-ocr_engine_v4.2.0.py
+```
+run_cli.bat
 ```
 
-目前正式主程式就是：
+依序輸入：
+1. 來源路徑（PDF 單檔或資料夾）
+2. 輸出路徑
+3. 裝置選擇（1=GPU, 2=CPU）
+4. 是否啟用 Claude 校對（y/n）
 
-```text
-ocr_engine.py
+### argparse 模式（腳本/自動化）
+
+```powershell
+python .\ocr_engine.py --input "D:\scan" --output "D:\output" --device gpu --claude off
+```
+
+所有參數：
+
+| 參數 | 說明 | 預設 |
+|------|------|------|
+| `--input`, `-i` | 來源 PDF 或資料夾 | 必填 |
+| `--output`, `-o` | 輸出資料夾 | 必填 |
+| `--device` | `gpu` 或 `cpu` | `gpu` |
+| `--claude` | `on` 或 `off` | `off` |
+| `--recursive` | 遞迴處理子資料夾 | 停用 |
+| `--overwrite` | 覆蓋已有輸出 | 停用 |
+| `--skip-existing` | 跳過已有輸出 | 啟用 |
+| `--zoom` | `2`、`3`、`4` | `3` |
+| `--preprocess` | `auto`、`original`、`clahe`、`binary` | `auto` |
+| `--no-pdf` | 不輸出 PDF | 停用 |
+| `--no-txt` | 不輸出 TXT | 停用 |
+| `--no-analysis` | 不輸出品質分析 | 停用 |
+| `--no-verify-log` | 不輸出校正日誌 | 停用 |
+
+查看說明：
+
+```powershell
+python .\ocr_engine.py --help
 ```
 
 ---
 
-## 操作流程
+## 批次處理
 
-啟動：
-
-```powershell
-cd "C:\Users\Rossi\Documents\Claude\OCR"
-python .\ocr_engine.py
-```
-
-程式會依序詢問：
-
-### 1. 來源路徑
-
-可輸入單一 PDF：
-
-```text
-C:\Books\賴樹聲 電磁波.pdf
-```
-
-也可輸入整個資料夾：
-
-```text
-C:\Books\Input
-```
-
-輸入資料夾時，程式會批次處理資料夾內所有 PDF。
-
-### 2. 輸出路徑
-
-例如：
-
-```text
-C:\Books\Output
-```
-
-若目錄不存在，程式會自動建立。
-
-### 3. 選擇 GPU 或 CPU
-
-```text
-1: GPU[RTX 3060]
-2: CPU
-```
-
-第一次建議選 GPU `1`。
-
-若 GPU 環境異常，程式會自動回退 CPU。
-
-### 4. 是否啟用 Claude 校對
-
-只測本地 OCR：
-
-```text
-n
-```
-
-啟用 Claude：
-
-```text
-y
-```
-
-首次驗證建議先選 `n`，使用 3～10 頁 PDF 測試輸出品質與速度。
+- 輸入路徑若為資料夾，自動掃描全部 `.pdf`
+- `--recursive` 可遞迴處理子資料夾
+- GUI 批次清單支援多選、移除、重試失敗檔案
+- 預設啟用 `skip_existing`：輸出 PDF 已存在時跳過
 
 ---
 
-## Claude API 設定
+## 設定記憶（GUI）
 
-啟用 Claude 前，在同一個 PowerShell 視窗設定：
+GUI 自動記憶設定至：
 
-```powershell
-$env:CLAUDE_API_KEY="你的 API Key"
+```
+C:\Users\Rossi\Documents\Claude\OCR\data\gui_settings.json
 ```
 
-需要指定模型時：
+記憶內容：
+- 最後使用的來源 / 輸出路徑
+- 裝置選擇（GPU/CPU）
+- Claude 校對開關與模型名稱
+- Zoom、預處理模式
+- 輸出選項（PDF/TXT/分析/日誌）
+- Overwrite / Skip existing 設定
+- 置信度門檻
+- 視窗位置與大小
 
-```powershell
-$env:CLAUDE_MODEL="模型名稱"
-```
-
-再執行：
-
-```powershell
-python .\ocr_engine.py
-```
-
-若未設定 API Key，程式會自動取消 AI 校對並繼續本地 OCR。
-
-注意：Claude API 會產生額外費用，費用依模型與輸入文字量計算。
+**注意**：API Key 不會儲存在設定檔，請使用環境變數設定。
 
 ---
 
-## 第一次測試建議
+## GPU / CPU 選擇
 
-先準備 3～10 頁 PDF，執行：
+GPU 模式啟動時會自動：
+1. 偵測 cuDNN / cuBLAS DLL 是否存在
+2. 在獨立子程序執行 Conv2D 測試
+3. 若任一步驟失敗，自動回退 CPU，不會崩潰
 
-```powershell
-python .\ocr_engine.py
-```
-
-選擇：
-
-```text
-來源：測試 PDF
-輸出：空白測試資料夾
-裝置：1
-Claude：n
-```
-
-確認：
-
-- `_OCR.pdf` 可以正常開啟
-- PDF 內可以搜尋文字
-- `_OCR.txt` 有正確頁碼與文字
-- `verify_log.txt` 有處理紀錄
-- GPU 測試成功或正確回退 CPU
-- 頁面尺寸與原始 PDF 一致
-
-確認後再批次處理大量書籍。
+GUI 提供「測試 GPU」按鈕可手動觸發測試。
 
 ---
 
-## 常見問題
-
-### 找不到 `cudnn_ops_infer64_8.dll`
-
-重新執行：
+## Claude API Key
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\install_ocr_gpu.ps1"
+# PowerShell（僅當前 session）
+$env:CLAUDE_API_KEY="sk-ant-..."
+
+# 永久設定（Windows 環境變數）
+[System.Environment]::SetEnvironmentVariable("CLAUDE_API_KEY","sk-ant-...","User")
 ```
 
-並確認：
+指定模型：
 
 ```powershell
-python -m pip show nvidia-cudnn-cu11
+$env:CLAUDE_MODEL="claude-3-5-sonnet-20240620"
 ```
 
-### 找不到 `cublasLt64_11.dll`
-
-確認已安裝：
-
-```powershell
-python -m pip show nvidia-cublas-cu11
-```
-
-### GPU 測試失敗
-
-程式會自動回退 CPU，不會中止整批 OCR。
-
-可以執行：
-
-```powershell
-python -c "import paddle; print(paddle.__version__); print(paddle.device.is_compiled_with_cuda()); print(paddle.device.get_device())"
-```
-
-### OCR 結果仍有錯字
-
-可依序嘗試：
-
-1. 啟用 Claude 校對
-2. 使用更清楚的掃描來源
-3. 對特定術語擴充 `HARD_CODED_CORRECTIONS`
-4. 將少數問題頁以更高解析度重新掃描
-5. 安裝 Nougat 或 Surya 作為專用引擎
-
-### PDF 被其他程式占用
-
-若目標 PDF 正被開啟，程式會改用時間戳檔名輸出，避免整批失敗。
-
-### 沒有 NVIDIA GPU
-
-選擇：
-
-```text
-2: CPU
-```
-
-CPU 模式仍可完整輸出 OCR PDF 與文字檔，只是速度較慢。
+**API Key 絕不儲存在任何設定檔或程式碼中。**
 
 ---
 
-## 固定環境注意事項
+## 輸出檔案用途
 
-不要任意單獨升級：
+每份來源 PDF 會同時產生：
+
+| 檔案 | 說明 |
+|------|------|
+| `<原檔名>_OCR.pdf` | 含隱藏文字層的可搜尋 PDF |
+| `<原檔名>_OCR.txt` | 純文字，含頁碼分隔 |
+| `<原檔名>_OCR_analysis.txt` | 每頁品質分析（置信度、疑似亂碼、校正項目） |
+
+輸出資料夾另保留：
+
+| 檔案 | 說明 |
+|------|------|
+| `verify_log.txt` | 校正前後對照日誌 |
+
+---
+
+## 暫停／取消
+
+- **暫停**：目前頁面完成後停止（不中斷正在執行的 OCR）
+- **繼續**：從下一頁繼續
+- **取消目前任務**：跳過剩餘頁面，進入下一個檔案
+- **全部取消**：停止整個批次
+
+---
+
+## 常見錯誤
+
+| 症狀 | 解決方式 |
+|------|---------|
+| `Python 已停止運作` | 使用 GPU 模式但 DLL 不完整；程式會自動偵測並回退 CPU |
+| `AuthenticationError` | CLAUDE_API_KEY 無效或未設定 |
+| `PackageNotFoundError: paddleocr` | 執行安裝腳本 `install_ocr_gpu.ps1` |
+| NumPy 2.x 衝突警告 | `pip install "numpy<2.0"` |
+| Pillow 11.x 衝突警告 | `pip install "pillow<11.0"` |
+| 設定檔損毀 | 自動重新命名為 `gui_settings.broken.json`，使用預設值 |
+
+---
+
+## Windows DLL 說明
+
+程式啟動時自動加入以下 DLL 搜尋路徑：
+
+- `site-packages/nvidia/cublas/bin`
+- `site-packages/nvidia/cudnn/bin`
+- `site-packages/nvidia/cuda_runtime/bin`
+- `site-packages/paddle/base`
+- `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin`
+- `%CUDA_PATH%\bin`（若環境變數存在）
+
+若仍找不到 DLL，改用 CPU 模式。
+
+---
+
+## Nougat / Surya 安全停用
+
+Nougat（物理公式）與 Surya（財經雙欄）為可選引擎，預設**停用**：
 
 ```powershell
-pip install --upgrade numpy
-pip install --upgrade pillow
-pip install --upgrade opencv-python
-pip install --upgrade albumentations
-pip install --upgrade albucore
-pip install --upgrade paddleocr
+# 啟用可選引擎測試（僅供測試用）
+$env:OCR_ENABLE_OPTIONAL_ENGINES="1"
 ```
 
-可能造成：
+停用時 PaddleOCR 獨立完整運作，不因 PyTorch DLL 問題崩潰。
 
-- NumPy 2.x 衝突
-- OpenCV 套件互相覆蓋
-- Albumentations / Albucore 不相容
-- PaddleOCR 3.x 參數不相容
-- cuDNN DLL 找不到
-- Paddle GPU 原生崩潰
+---
 
-建議使用專案固定的：
+## 固定套件版本
 
-```text
-requirements-ocr-gpu.txt
+```
+Python            3.12.x
+paddlepaddle-gpu  2.6.1
+paddleocr         2.10.0
+nvidia-cudnn-cu11 8.9.5.29
+numpy             1.26.4
+pillow            10.4.0
+opencv-python     4.10.0.84
+albumentations    1.4.11
+albucore          0.0.16
+tifffile          2024.9.20
 ```
 
 ---
 
-## 使用情境
+## 不可隨意升級的套件
 
-本工具適合：
+以下套件**禁止**單獨執行 `pip install --upgrade`：
 
-- 大量舊書掃描搜尋化
-- 學術講義與研究資料整理
-- 物理、電磁學與工程教材 OCR
-- 財經雜誌與投資資料數位化
-- 個人 PDF 知識庫建立
-- AI 摘要前的文字抽取
-- 文件全文索引
-- 檔案批次轉換與備份
+- `numpy`（2.x 與 PaddleOCR 不相容）
+- `pillow`（11.x 與 PaddleOCR 不相容）
+- `opencv-python`（避免與 headless 版衝突）
+- `albumentations`（2.x 參數不相容）
+- `albucore`（配合 albumentations）
+- `paddleocr`（3.x API 不相容）
+- `paddlepaddle-gpu`（需配合 cuDNN 8.x）
 
----
-
-## 版本摘要
-
-### v4.2.0
-
-- 新增原圖、CLAHE、自適應二值化三路候選
-- 自動選擇最佳 OCR 結果
-- 強化泛黃、淡字、印章與模糊掃描
-- 新增 `_OCR.txt` 純文字輸出
-- 保留透明文字層與原始版面
-- 保留 GPU DLL 自動載入
-- 保留獨立 GPU Conv2D 自我測試
-- GPU 失敗時自動回退 CPU
-- 擴充物理、電磁學與繁體中文校正
-- 可選 Claude AI 批次校對
-- 正式啟動檔名統一為 `ocr_engine.py`
-
----
-
-## 授權與資料注意事項
-
-請只處理你有權使用、備份或數位化的 PDF 文件。
-
-不要將受版權保護的測試 PDF、私人文件、API Key、環境快照或 OCR 輸出直接上傳到公開 GitHub 儲存庫。
+若需更新，請使用完整安裝腳本 `install_ocr_gpu.ps1` 重新安裝。
