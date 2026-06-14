@@ -1,5 +1,5 @@
-# ocr_gui.py — Full tkinter GUI for OCR Engine v4.4.0
-# Window title: OCR Engine v4.4.0 — PDF 搜尋化與品質分析系統
+# ocr_gui.py — Full tkinter GUI for OCR Engine v4.4.1
+# Window title: OCR Engine v4.4.1 — PDF 搜尋化與品質分析系統
 
 import os
 import sys
@@ -12,13 +12,42 @@ import traceback
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
+
+# ---------------------------------------------------------------------------
 # DPI awareness (Windows only, must be before Tk())
-if sys.platform == "win32":
+# ---------------------------------------------------------------------------
+def enable_windows_dpi_awareness():
+    """Enable per-monitor DPI awareness before creating the Tk window."""
+    if sys.platform != "win32":
+        return
     try:
         import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor v1
+        return
     except Exception:
         pass
+    try:
+        import ctypes
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+enable_windows_dpi_awareness()
+
+
+# ---------------------------------------------------------------------------
+# DPI scale helper
+# ---------------------------------------------------------------------------
+def get_dpi_scale(root) -> float:
+    """Calculate DPI scale factor from actual screen DPI. Returns value in [1.0, 2.5]."""
+    try:
+        dpi = root.winfo_fpixels("1i")  # pixels per inch
+        scale = dpi / 72.0
+        return max(1.0, min(2.5, scale))
+    except Exception:
+        return 1.0
+
 
 # ---------------------------------------------------------------------------
 # Lazy import of OCRProcessor so GUI starts instantly without loading Paddle
@@ -42,7 +71,7 @@ def _ensure_ocr_core():
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION = "v4.4.0"
+VERSION = "v4.4.1"
 TITLE = f"OCR Engine {VERSION} — PDF 搜尋化與品質分析系統"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(PROJECT_DIR, "logs")
@@ -100,19 +129,15 @@ class OCRGuiApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(TITLE)
-        self.root.minsize(1100, 720)
 
         # Load settings
         from settings_manager import SettingsManager
         self._sm = SettingsManager()
         self._settings = self._sm.load()
 
-        # Apply saved geometry
-        geom = self._settings.get("window_geometry", "1280x820+100+80")
-        try:
-            self.root.geometry(geom)
-        except Exception:
-            self.root.geometry("1280x820+100+80")
+        # DPI scale
+        self._dpi_scale = get_dpi_scale(root)
+        self._configure_fonts_and_styles()
 
         # Threading primitives
         self._pause_event = threading.Event()   # set = paused
@@ -135,6 +160,138 @@ class OCRGuiApp:
         self._start_queue_poll()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Restore geometry and sash positions after UI is built
+        self._calculate_initial_geometry()
+        self.root.update_idletasks()
+        self._restore_sash_positions()
+        self.root.bind("<Configure>", self._on_root_configure)
+
+    # -----------------------------------------------------------------------
+    # DPI / Font / Style configuration
+    # -----------------------------------------------------------------------
+    def _configure_fonts_and_styles(self):
+        from tkinter import font as tkfont
+        s = self._dpi_scale
+        # Base font size scales with DPI
+        base = max(10, min(13, int(10 * s)))
+        small = max(9, min(12, int(9 * s)))
+        mono = max(9, min(12, int(9 * s)))
+
+        # Preferred font families
+        families = tkfont.families()
+        preferred = ["Microsoft JhengHei UI", "Microsoft JhengHei", "Segoe UI", "TkDefaultFont"]
+        normal_family = next((f for f in preferred if f in families), "TkDefaultFont")
+        mono_family = next((f for f in ["Cascadia Mono", "Consolas", "Courier New"] if f in families), "Courier New")
+
+        self.font_normal = tkfont.Font(family=normal_family, size=base)
+        self.font_small  = tkfont.Font(family=normal_family, size=small)
+        self.font_bold   = tkfont.Font(family=normal_family, size=base, weight="bold")
+        self.font_mono   = tkfont.Font(family=mono_family,   size=mono)
+        self.font_button = tkfont.Font(family=normal_family, size=base)
+
+        # Treeview row height from actual font metrics
+        lh = self.font_normal.metrics("linespace")
+        row_h = lh + 10
+
+        style = ttk.Style()
+        style.configure("TLabel",            font=self.font_normal)
+        style.configure("TButton",           font=self.font_button, padding=(8, 5))
+        style.configure("TCheckbutton",      font=self.font_normal, padding=(2, 3))
+        style.configure("TRadiobutton",      font=self.font_normal, padding=(2, 3))
+        style.configure("TLabelframe.Label", font=self.font_bold)
+        style.configure("TEntry",            padding=(4, 4))
+        style.configure("TCombobox",         padding=(4, 4))
+        style.configure("Treeview",          font=self.font_normal, rowheight=row_h)
+        style.configure("Treeview.Heading",  font=self.font_bold,   padding=(4, 5))
+        style.configure("TScale",            sliderlength=int(20 * s))
+
+    def _calculate_initial_geometry(self):
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        w = min(max(int(sw * 0.85), 1100), 1600)
+        h = min(max(int(sh * 0.82), 720), 1000)
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        # Check saved geometry
+        saved = self._settings.get("window_geometry", "")
+        state = self._settings.get("window_state", "normal")
+        if saved and saved != "1280x820+100+80":
+            try:
+                self.root.geometry(saved)
+                # Validate it's on screen
+                self.root.update_idletasks()
+                wx = self.root.winfo_x()
+                wy = self.root.winfo_y()
+                ww = self.root.winfo_width()
+                wh = self.root.winfo_height()
+                if wx < -ww or wy < -wh or wx > sw or wy > sh:
+                    raise ValueError("Off screen")
+            except Exception:
+                self.root.geometry(f"{w}x{h}+{x}+{y}")
+        else:
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+        if state == "zoomed":
+            self.root.after(100, lambda: self.root.state("zoomed"))
+        # Min size scales with DPI but caps for small screens
+        min_w = min(int(1100 * self._dpi_scale), sw - 50)
+        min_h = min(int(720  * self._dpi_scale), sh - 50)
+        self.root.minsize(max(800, min_w), max(600, min_h))
+
+    def _restore_sash_positions(self):
+        try:
+            sw = self.root.winfo_width()
+            saved_sash = self._settings.get("horizontal_sash_position", 0)
+            if saved_sash and saved_sash > 100:
+                self._main_pane.sashpos(0, saved_sash)
+            else:
+                # Default: 25% of window width
+                self._main_pane.sashpos(0, max(280, int(sw * 0.25)))
+        except Exception:
+            pass
+
+    def _on_root_configure(self, event=None):
+        if event and event.widget != self.root:
+            return
+        self.root.after_idle(self._update_wraplengths)
+        self.root.after_idle(self._resize_tree_columns)
+
+    def _update_wraplengths(self):
+        try:
+            w = self._left_canvas.winfo_width()
+            wrap = max(120, w - 20)
+            self._lbl_api_status.configure(wraplength=wrap)
+            self._lbl_gpu_status.configure(wraplength=wrap)
+        except Exception:
+            pass
+
+    def _resize_tree_columns(self, event=None):
+        try:
+            total = self._tree.winfo_width()
+            if total < 100:
+                return
+            s = self._dpi_scale
+            # Fixed-width columns (DPI-scaled)
+            fixed = {
+                "編號":    int(40  * s),
+                "頁數":    int(50  * s),
+                "狀態":    int(80  * s),
+                "進度":    int(70  * s),
+                "平均秒/頁": int(75 * s),
+            }
+            fixed_total = sum(fixed.values())
+            scrollbar_w = int(18 * s)
+            remaining = max(0, total - fixed_total - scrollbar_w)
+            stretch = {
+                "檔名":   int(remaining * 0.35),
+                "輸出PDF": int(remaining * 0.22),
+                "輸出TXT": int(remaining * 0.22),
+                "分析檔":  int(remaining * 0.21),
+            }
+            for col, w in {**fixed, **stretch}.items():
+                self._tree.column(col, width=max(30, w))
+        except Exception:
+            pass
 
     # -----------------------------------------------------------------------
     # Log file
@@ -178,22 +335,41 @@ class OCRGuiApp:
         frm.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 2))
         frm.columnconfigure(1, weight=1)
 
-        # Row 1: Source
+        # Row 0: Source
         ttk.Label(frm, text="來源：").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self._var_input = tk.StringVar()
         ttk.Entry(frm, textvariable=self._var_input).grid(row=0, column=1, sticky="ew", padx=2)
-        ttk.Button(frm, text="選擇 PDF", command=self._browse_pdf).grid(row=0, column=2, padx=2)
-        ttk.Button(frm, text="選擇資料夾", command=self._browse_input_folder).grid(row=0, column=3, padx=2)
-        ttk.Button(frm, text="清除來源", command=self._clear_input).grid(row=0, column=4, padx=2)
 
-        # Row 2: Output
+        # Source button sub-frame (two rows)
+        src_btn_frm = ttk.Frame(frm)
+        src_btn_frm.grid(row=0, column=2, padx=(4, 0))
+        src_btn_frm.columnconfigure(0, weight=1)
+        src_btn_frm.columnconfigure(1, weight=1)
+        ttk.Button(src_btn_frm, text="選擇 PDF", command=self._browse_pdf).grid(
+            row=0, column=0, sticky="ew", padx=1, pady=1)
+        ttk.Button(src_btn_frm, text="選擇資料夾", command=self._browse_input_folder).grid(
+            row=0, column=1, sticky="ew", padx=1, pady=1)
+        ttk.Button(src_btn_frm, text="清除來源", command=self._clear_input).grid(
+            row=1, column=0, sticky="ew", padx=1, pady=1)
+        ttk.Button(src_btn_frm, text="重新掃描", command=self._rescan_batch).grid(
+            row=1, column=1, sticky="ew", padx=1, pady=1)
+
+        # Row 1: Output
         ttk.Label(frm, text="輸出：").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
         self._var_output = tk.StringVar()
         ttk.Entry(frm, textvariable=self._var_output).grid(row=1, column=1, sticky="ew", padx=2, pady=(4, 0))
-        ttk.Button(frm, text="選擇輸出資料夾", command=self._browse_output_folder).grid(row=1, column=2, padx=2, pady=(4, 0))
-        ttk.Button(frm, text="開啟輸出資料夾", command=self._open_output_folder).grid(row=1, column=3, padx=2, pady=(4, 0))
 
-        # Row 3: Recursive
+        # Output button sub-frame
+        out_btn_frm = ttk.Frame(frm)
+        out_btn_frm.grid(row=1, column=2, padx=(4, 0), pady=(4, 0))
+        out_btn_frm.columnconfigure(0, weight=1)
+        out_btn_frm.columnconfigure(1, weight=1)
+        ttk.Button(out_btn_frm, text="選擇輸出資料夾", command=self._browse_output_folder).grid(
+            row=0, column=0, sticky="ew", padx=1, pady=1)
+        ttk.Button(out_btn_frm, text="開啟輸出資料夾", command=self._open_output_folder).grid(
+            row=0, column=1, sticky="ew", padx=1, pady=1)
+
+        # Row 2: Recursive
         self._var_recursive = tk.BooleanVar()
         ttk.Checkbutton(frm, text="包含子資料夾", variable=self._var_recursive).grid(
             row=2, column=1, sticky="w", pady=(2, 0)
@@ -203,6 +379,7 @@ class OCRGuiApp:
     def _build_main_area(self):
         pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         pane.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        self._main_pane = pane
 
         # Left settings panel
         left = ttk.Frame(pane, width=280)
@@ -219,105 +396,116 @@ class OCRGuiApp:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
 
-        canvas = tk.Canvas(parent, borderwidth=0, highlightthickness=0)
-        scroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scroll.set)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        scroll.grid(row=0, column=1, sticky="ns")
+        self._left_canvas = tk.Canvas(parent, borderwidth=0, highlightthickness=0)
+        left_scrollbar = ttk.Scrollbar(parent, orient="vertical", command=self._left_canvas.yview)
+        self._left_canvas.configure(yscrollcommand=left_scrollbar.set)
 
-        inner = ttk.Frame(canvas)
-        inner_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        self._left_canvas.grid(row=0, column=0, sticky="nsew")
+        left_scrollbar.grid(row=0, column=1, sticky="ns")
 
-        def _on_configure(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(inner_window, width=canvas.winfo_width())
+        self._left_inner = ttk.Frame(self._left_canvas)
+        self._left_inner_id = self._left_canvas.create_window(
+            (0, 0), window=self._left_inner, anchor="nw"
+        )
 
-        inner.bind("<Configure>", _on_configure)
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(inner_window, width=e.width))
+        def _on_inner_configure(event):
+            self._left_canvas.configure(scrollregion=self._left_canvas.bbox("all"))
 
-        self._build_settings_inner(inner)
+        def _on_canvas_configure(event):
+            self._left_canvas.itemconfig(self._left_inner_id, width=event.width)
+            self._update_wraplengths()
+
+        self._left_inner.bind("<Configure>", _on_inner_configure)
+        self._left_canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Mouse wheel scrolling only when cursor is over left panel
+        def _on_mousewheel(event):
+            self._left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        self._left_canvas.bind("<Enter>", lambda e: self._left_canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        self._left_canvas.bind("<Leave>", lambda e: self._left_canvas.unbind_all("<MouseWheel>"))
+
+        self._build_settings_inner(self._left_inner)
 
     def _build_settings_inner(self, parent):
         row = 0
 
-        # OCR Settings LabelFrame
+        # ---- 1. 執行裝置 ----
+        dev_frm = ttk.LabelFrame(parent, text="執行裝置", padding=8)
+        dev_frm.grid(row=row, column=0, sticky="ew", padx=4, pady=6)
+        dev_frm.columnconfigure(0, weight=1)
+        row += 1
+
+        radio_row = ttk.Frame(dev_frm)
+        radio_row.grid(row=0, column=0, sticky="w", pady=3)
+        self._var_device = tk.StringVar(value="gpu")
+        ttk.Radiobutton(radio_row, text="GPU", variable=self._var_device, value="gpu").pack(side="left")
+        ttk.Radiobutton(radio_row, text="CPU", variable=self._var_device, value="cpu").pack(side="left", padx=(8, 0))
+
+        self._lbl_gpu_status = ttk.Label(dev_frm, text="GPU 狀態：尚未測試",
+                                          foreground="#666666", wraplength=220, justify=tk.LEFT)
+        self._lbl_gpu_status.grid(row=1, column=0, sticky="w", pady=3)
+
+        ttk.Button(dev_frm, text="測試 GPU", command=self._test_gpu).grid(
+            row=2, column=0, sticky="w", pady=3
+        )
+
+        # ---- 2. Claude 校對 ----
+        claude_frm = ttk.LabelFrame(parent, text="Claude 校對", padding=8)
+        claude_frm.grid(row=row, column=0, sticky="ew", padx=4, pady=6)
+        claude_frm.columnconfigure(1, weight=1)
+        row += 1
+
+        cr = 0
+        self._var_claude = tk.BooleanVar()
+        ttk.Checkbutton(claude_frm, text="啟用 Claude 校對", variable=self._var_claude).grid(
+            row=cr, column=0, columnspan=2, sticky="w", pady=3
+        )
+        cr += 1
+
+        self._lbl_api_status = ttk.Label(
+            claude_frm, text="API Key：未設定", foreground="#B71C1C",
+            wraplength=220, justify=tk.LEFT, anchor="w"
+        )
+        self._lbl_api_status.grid(row=cr, column=0, columnspan=2, sticky="w", pady=3)
+        self._update_api_key_label()
+        cr += 1
+
+        ttk.Label(claude_frm, text="Claude 模型：").grid(row=cr, column=0, sticky="w", pady=3)
+        self._var_claude_model = tk.StringVar()
+        ttk.Entry(claude_frm, textvariable=self._var_claude_model, width=22).grid(row=cr, column=1, sticky="ew", pady=3)
+        cr += 1
+
+        ttk.Button(claude_frm, text="測試 Claude API", command=self._test_claude_api).grid(
+            row=cr, column=0, columnspan=2, sticky="w", pady=3
+        )
+
+        # ---- 3. OCR 設定 ----
         ocr_frm = ttk.LabelFrame(parent, text="OCR 設定", padding=8)
-        ocr_frm.grid(row=row, column=0, sticky="ew", padx=4, pady=4)
+        ocr_frm.grid(row=row, column=0, sticky="ew", padx=4, pady=6)
         ocr_frm.columnconfigure(1, weight=1)
         row += 1
 
-        r = 0
-        # Device
-        ttk.Label(ocr_frm, text="運算裝置：").grid(row=r, column=0, sticky="w")
-        dev_frm = ttk.Frame(ocr_frm)
-        dev_frm.grid(row=r, column=1, sticky="w")
-        self._var_device = tk.StringVar(value="gpu")
-        ttk.Radiobutton(dev_frm, text="GPU", variable=self._var_device, value="gpu").pack(side="left")
-        ttk.Radiobutton(dev_frm, text="CPU", variable=self._var_device, value="cpu").pack(side="left", padx=(8, 0))
-        r += 1
-
-        # GPU status label
-        self._lbl_gpu_status = ttk.Label(ocr_frm, text="GPU 狀態：尚未測試", foreground="#666666", wraplength=200)
-        self._lbl_gpu_status.grid(row=r, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        r += 1
-
-        # Test GPU button
-        ttk.Button(ocr_frm, text="測試 GPU", command=self._test_gpu).grid(
-            row=r, column=0, columnspan=2, sticky="w", pady=(2, 4)
-        )
-        r += 1
-
-        # Separator
-        ttk.Separator(ocr_frm, orient="horizontal").grid(row=r, column=0, columnspan=2, sticky="ew", pady=4)
-        r += 1
-
-        # Claude
-        self._var_claude = tk.BooleanVar()
-        ttk.Checkbutton(ocr_frm, text="啟用 Claude 校對", variable=self._var_claude).grid(
-            row=r, column=0, columnspan=2, sticky="w"
-        )
-        r += 1
-
-        self._lbl_api_status = ttk.Label(ocr_frm, text="API Key：未設定", foreground="#B71C1C", wraplength=200)
-        self._lbl_api_status.grid(row=r, column=0, columnspan=2, sticky="w")
-        self._update_api_key_label()
-        r += 1
-
-        ttk.Label(ocr_frm, text="Claude 模型：").grid(row=r, column=0, sticky="w")
-        self._var_claude_model = tk.StringVar()
-        ttk.Entry(ocr_frm, textvariable=self._var_claude_model, width=22).grid(row=r, column=1, sticky="ew")
-        r += 1
-
-        ttk.Button(ocr_frm, text="測試 Claude API", command=self._test_claude_api).grid(
-            row=r, column=0, columnspan=2, sticky="w", pady=(2, 4)
-        )
-        r += 1
-
-        ttk.Separator(ocr_frm, orient="horizontal").grid(row=r, column=0, columnspan=2, sticky="ew", pady=4)
-        r += 1
-
-        # Zoom
-        ttk.Label(ocr_frm, text="縮放倍率：").grid(row=r, column=0, sticky="w")
+        or_ = 0
+        ttk.Label(ocr_frm, text="縮放倍率：").grid(row=or_, column=0, sticky="w", pady=3)
         self._var_zoom = tk.StringVar(value="3")
         ttk.Combobox(ocr_frm, textvariable=self._var_zoom, values=["2", "3", "4"],
-                     state="readonly", width=6).grid(row=r, column=1, sticky="w")
-        r += 1
+                     state="readonly", width=6).grid(row=or_, column=1, sticky="w", pady=3)
+        or_ += 1
 
-        # Preprocess
-        ttk.Label(ocr_frm, text="預處理模式：").grid(row=r, column=0, sticky="w")
+        ttk.Label(ocr_frm, text="預處理模式：").grid(row=or_, column=0, sticky="w", pady=3)
         self._var_preprocess = tk.StringVar(value="自動選最佳")
         ttk.Combobox(
             ocr_frm, textvariable=self._var_preprocess,
             values=list(PREPROCESS_LABELS.keys()), state="readonly", width=12
-        ).grid(row=r, column=1, sticky="w")
-        r += 1
+        ).grid(row=or_, column=1, sticky="w", pady=3)
 
-        ttk.Separator(ocr_frm, orient="horizontal").grid(row=r, column=0, columnspan=2, sticky="ew", pady=4)
-        r += 1
+        # ---- 4. 輸出選項 ----
+        out_frm = ttk.LabelFrame(parent, text="輸出選項", padding=8)
+        out_frm.grid(row=row, column=0, sticky="ew", padx=4, pady=6)
+        out_frm.columnconfigure(0, weight=1)
+        row += 1
 
-        # Output options
-        ttk.Label(ocr_frm, text="輸出選項：").grid(row=r, column=0, sticky="w")
-        r += 1
         self._var_out_pdf = tk.BooleanVar(value=True)
         self._var_out_txt = tk.BooleanVar(value=True)
         self._var_out_analysis = tk.BooleanVar(value=True)
@@ -331,47 +519,44 @@ class OCRGuiApp:
             (self._var_out_verify, "輸出校正日誌"),
             (self._var_preserve, "保留相對資料夾結構"),
         ]:
-            ttk.Checkbutton(ocr_frm, text=label, variable=var).grid(
-                row=r, column=0, columnspan=2, sticky="w"
+            ttk.Checkbutton(out_frm, text=label, variable=var).grid(
+                row=out_frm.grid_size()[1], column=0, sticky="w", pady=3
             )
-            r += 1
 
-        ttk.Separator(ocr_frm, orient="horizontal").grid(row=r, column=0, columnspan=2, sticky="ew", pady=4)
-        r += 1
+        # ---- 5. 檔案處理 ----
+        file_frm = ttk.LabelFrame(parent, text="檔案處理", padding=8)
+        file_frm.grid(row=row, column=0, sticky="ew", padx=4, pady=6)
+        file_frm.columnconfigure(0, weight=1)
+        row += 1
 
-        # Overwrite / skip existing (mutually exclusive)
         self._var_overwrite = tk.BooleanVar()
         self._var_skip_existing = tk.BooleanVar(value=True)
-        cb_overwrite = ttk.Checkbutton(
-            ocr_frm, text="覆蓋已有輸出", variable=self._var_overwrite,
+        ttk.Checkbutton(
+            file_frm, text="覆蓋已有輸出", variable=self._var_overwrite,
             command=self._on_overwrite_changed
-        )
-        cb_overwrite.grid(row=r, column=0, columnspan=2, sticky="w")
-        r += 1
-        cb_skip = ttk.Checkbutton(
-            ocr_frm, text="跳過已有輸出", variable=self._var_skip_existing,
+        ).grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Checkbutton(
+            file_frm, text="跳過已有輸出", variable=self._var_skip_existing,
             command=self._on_skip_existing_changed
-        )
-        cb_skip.grid(row=r, column=0, columnspan=2, sticky="w")
-        r += 1
+        ).grid(row=1, column=0, sticky="w", pady=3)
 
-        ttk.Separator(ocr_frm, orient="horizontal").grid(row=r, column=0, columnspan=2, sticky="ew", pady=4)
-        r += 1
+        # ---- 6. 品質分析 ----
+        qa_frm = ttk.LabelFrame(parent, text="品質分析", padding=8)
+        qa_frm.grid(row=row, column=0, sticky="ew", padx=4, pady=6)
+        qa_frm.columnconfigure(1, weight=1)
+        row += 1
 
-        # Confidence threshold
-        ttk.Label(ocr_frm, text="置信度門檻：").grid(row=r, column=0, sticky="w")
+        ttk.Label(qa_frm, text="置信度門檻：").grid(row=0, column=0, sticky="w", pady=3)
         self._var_conf = tk.DoubleVar(value=0.70)
-        self._lbl_conf_val = ttk.Label(ocr_frm, text="0.70")
-        self._lbl_conf_val.grid(row=r, column=1, sticky="w")
-        r += 1
+        self._lbl_conf_val = ttk.Label(qa_frm, text="0.70")
+        self._lbl_conf_val.grid(row=0, column=1, sticky="w", pady=3)
         conf_scale = ttk.Scale(
-            ocr_frm, from_=0.50, to=0.95, variable=self._var_conf, orient="horizontal",
+            qa_frm, from_=0.50, to=0.95, variable=self._var_conf, orient="horizontal",
             command=lambda v: self._lbl_conf_val.config(text=f"{float(v):.2f}")
         )
-        conf_scale.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 4))
-        r += 1
+        conf_scale.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
 
-        # Reset defaults button
+        # ---- Bottom: Reset defaults ----
         ttk.Button(parent, text="恢復預設設定", command=self._reset_defaults).grid(
             row=row, column=0, sticky="ew", padx=4, pady=(0, 4)
         )
@@ -403,7 +588,11 @@ class OCRGuiApp:
 
         cols = ("編號", "檔名", "頁數", "狀態", "進度", "平均秒/頁", "輸出PDF", "輸出TXT", "分析檔")
         self._tree = ttk.Treeview(batch_frm, columns=cols, show="headings", selectmode="extended")
-        col_widths = [40, 240, 50, 80, 80, 80, 80, 80, 80]
+        s = self._dpi_scale
+        col_widths = [
+            int(40 * s), int(240 * s), int(50 * s), int(80 * s), int(80 * s),
+            int(80 * s), int(80 * s), int(80 * s), int(80 * s)
+        ]
         for col, w in zip(cols, col_widths):
             self._tree.heading(col, text=col)
             self._tree.column(col, width=w, minwidth=30)
@@ -417,6 +606,7 @@ class OCRGuiApp:
 
         self._tree.bind("<Double-1>", self._on_tree_double_click)
         self._tree.bind("<Button-3>", self._on_tree_right_click)
+        self._tree.bind("<Configure>", self._resize_tree_columns)
 
         # Context menu
         self._ctx_menu = tk.Menu(self.root, tearoff=0)
@@ -434,10 +624,10 @@ class OCRGuiApp:
 
         # Current file
         ttk.Label(frm, text="目前檔案：").grid(row=0, column=0, sticky="w")
-        self._lbl_current_file = ttk.Label(frm, text="—")
+        self._lbl_current_file = ttk.Label(frm, text="—", wraplength=600)
         self._lbl_current_file.grid(row=0, column=1, sticky="w")
 
-        self._pbar_file = ttk.Progressbar(frm, mode="determinate", length=400)
+        self._pbar_file = ttk.Progressbar(frm, mode="determinate")
         self._pbar_file.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 0))
 
         self._lbl_page_info = ttk.Label(frm, text="")
@@ -445,7 +635,7 @@ class OCRGuiApp:
 
         # Overall
         ttk.Label(frm, text="整體進度：").grid(row=3, column=0, sticky="w", pady=(4, 0))
-        self._pbar_overall = ttk.Progressbar(frm, mode="determinate", length=400)
+        self._pbar_overall = ttk.Progressbar(frm, mode="determinate")
         self._pbar_overall.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(2, 0))
 
         self._lbl_overall_info = ttk.Label(frm, text="")
@@ -457,9 +647,11 @@ class OCRGuiApp:
         log_frm.columnconfigure(0, weight=1)
         log_frm.rowconfigure(0, weight=1)
 
+        mono_size = self.font_mono.cget("size")
+        log_height = max(int(6 * self._dpi_scale), 6)
         self._log_text = scrolledtext.ScrolledText(
-            log_frm, height=8, state="disabled",
-            font=("Consolas", 9), wrap="word"
+            log_frm, height=log_height, state="disabled",
+            font=self.font_mono, wrap="word"
         )
         self._log_text.grid(row=0, column=0, sticky="nsew")
 
@@ -474,29 +666,36 @@ class OCRGuiApp:
             ttk.Button(btn_frm, text=text, command=cmd).pack(side="left", padx=2)
 
     def _build_bottom_bar(self):
-        bar = ttk.Frame(self.root, relief="groove", padding=4)
-        bar.grid(row=4, column=0, sticky="ew", padx=8, pady=(2, 8))
+        bar = ttk.Frame(self.root, padding=(4, 4))
+        bar.grid(row=4, column=0, sticky="ew", padx=6, pady=(2, 6))
+        bar.columnconfigure(0, weight=1)
 
-        self._btn_start = ttk.Button(bar, text="開始批次 OCR", command=self._start_batch)
-        self._btn_start.pack(side="left", padx=4)
+        # Row 0: main action buttons
+        row0 = ttk.Frame(bar)
+        row0.grid(row=0, column=0, sticky="ew")
 
-        self._btn_pause = ttk.Button(bar, text="暫停", command=self._pause_batch, state="disabled")
+        # Row 1: secondary buttons
+        row1 = ttk.Frame(bar)
+        row1.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+
+        self._btn_start = ttk.Button(row0, text="開始批次 OCR", command=self._start_batch)
+        self._btn_start.pack(side="left", padx=3)
+
+        self._btn_pause = ttk.Button(row0, text="暫停", command=self._pause_batch, state="disabled")
         self._btn_pause.pack(side="left", padx=2)
 
-        self._btn_resume = ttk.Button(bar, text="繼續", command=self._resume_batch, state="disabled")
+        self._btn_resume = ttk.Button(row0, text="繼續", command=self._resume_batch, state="disabled")
         self._btn_resume.pack(side="left", padx=2)
 
-        self._btn_cancel = ttk.Button(bar, text="取消目前任務", command=self._cancel_current, state="disabled")
+        self._btn_cancel = ttk.Button(row0, text="取消目前任務", command=self._cancel_current, state="disabled")
         self._btn_cancel.pack(side="left", padx=2)
 
-        self._btn_cancel_all = ttk.Button(bar, text="全部取消", command=self._cancel_all, state="disabled")
+        self._btn_cancel_all = ttk.Button(row0, text="全部取消", command=self._cancel_all, state="disabled")
         self._btn_cancel_all.pack(side="left", padx=2)
 
-        self._btn_retry = ttk.Button(bar, text="重試失敗", command=self._retry_failed)
-        self._btn_retry.pack(side="left", padx=2)
-
-        ttk.Button(bar, text="開啟輸出資料夾", command=self._open_output_folder).pack(side="left", padx=2)
-        ttk.Button(bar, text="關閉", command=self._on_close).pack(side="right", padx=4)
+        ttk.Button(row1, text="重試失敗", command=self._retry_failed).pack(side="left", padx=3)
+        ttk.Button(row1, text="開啟輸出資料夾", command=self._open_output_folder).pack(side="left", padx=2)
+        ttk.Button(row1, text="關閉", command=self._on_close).pack(side="right", padx=3)
 
     # -----------------------------------------------------------------------
     # Settings apply / collect
@@ -543,6 +742,13 @@ class OCRGuiApp:
         s["confidence_threshold"] = round(self._var_conf.get(), 2)
         try:
             s["window_geometry"] = self.root.geometry()
+        except Exception:
+            pass
+        s["window_state"] = self.root.state()
+        try:
+            # Save sash position if PanedWindow exists
+            if hasattr(self, '_main_pane'):
+                s["horizontal_sash_position"] = self._main_pane.sashpos(0)
         except Exception:
             pass
         return s
@@ -1041,7 +1247,7 @@ class OCRGuiApp:
         elif kind == "gpu_test_result":
             _, ok, detail = msg
             if ok:
-                self._lbl_gpu_status.config(text="GPU 狀態：測試通過 ✓", foreground="#2E7D32")
+                self._lbl_gpu_status.config(text="GPU 狀態：測試通過", foreground="#2E7D32")
                 self._append_log(f"[GPU] 測試通過。{detail}")
             else:
                 self._lbl_gpu_status.config(text=f"GPU 狀態：失敗 — {detail[:60]}", foreground="#B71C1C")

@@ -456,6 +456,155 @@ class TestHardCorrections(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 10. DPI layout regression tests
+# ---------------------------------------------------------------------------
+class TestDpiLayout(unittest.TestCase):
+    """Verify GUI layout helpers produce sane values at various DPI scales."""
+
+    def _make_app_no_mainloop(self, mock_scale=1.0):
+        """Create OCRGuiApp with patched DPI scale, destroy immediately after inspection."""
+        import tkinter as tk
+        from unittest.mock import patch
+        r = tk.Tk()
+        r.withdraw()  # Don't show window during test
+        with patch('ocr_gui.get_dpi_scale', return_value=mock_scale):
+            from ocr_gui import OCRGuiApp
+            app = OCRGuiApp(r)
+        r.update_idletasks()
+        return r, app
+
+    def _teardown(self, root):
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    def test_font_sizes_100pct(self):
+        r, app = self._make_app_no_mainloop(1.0)
+        try:
+            size = app.font_normal.cget("size")
+            self.assertGreaterEqual(size, 9)
+            self.assertLessEqual(size, 14)
+        finally:
+            self._teardown(r)
+
+    def test_font_sizes_150pct(self):
+        r, app = self._make_app_no_mainloop(1.5)
+        try:
+            size = app.font_normal.cget("size")
+            self.assertGreaterEqual(size, 10)
+            self.assertLessEqual(size, 16)
+        finally:
+            self._teardown(r)
+
+    def test_font_sizes_200pct(self):
+        r, app = self._make_app_no_mainloop(2.0)
+        try:
+            size = app.font_normal.cget("size")
+            self.assertGreaterEqual(size, 10)
+        finally:
+            self._teardown(r)
+
+    def test_treeview_rowheight_gt_linespace(self):
+        import tkinter as tk
+        from tkinter import ttk as _ttk
+        from tkinter import font as tkfont
+        from unittest.mock import patch
+        r = tk.Tk()
+        r.withdraw()
+        with patch('ocr_gui.get_dpi_scale', return_value=1.25):
+            from ocr_gui import OCRGuiApp
+            app = OCRGuiApp(r)
+        r.update_idletasks()
+        try:
+            lh = app.font_normal.metrics("linespace")
+            style = _ttk.Style()
+            rh = style.lookup("Treeview", "rowheight")
+            # rowheight must be > linespace
+            if rh:
+                self.assertGreater(int(rh), lh)
+        finally:
+            r.destroy()
+
+    def test_button_padding_nonzero(self):
+        import tkinter as tk
+        from tkinter import ttk as _ttk
+        from unittest.mock import patch
+        r = tk.Tk()
+        r.withdraw()
+        with patch('ocr_gui.get_dpi_scale', return_value=1.5):
+            from ocr_gui import OCRGuiApp
+            app = OCRGuiApp(r)
+        r.update_idletasks()
+        try:
+            style = _ttk.Style()
+            padding = style.lookup("TButton", "padding")
+            self.assertIsNotNone(padding)
+        finally:
+            r.destroy()
+
+    def test_wraplength_updates(self):
+        import tkinter as tk
+        from unittest.mock import patch
+        r = tk.Tk()
+        r.withdraw()
+        with patch('ocr_gui.get_dpi_scale', return_value=1.0):
+            from ocr_gui import OCRGuiApp
+            app = OCRGuiApp(r)
+        r.update_idletasks()
+        try:
+            # Force update
+            app._update_wraplengths()
+            wl = app._lbl_api_status.cget("wraplength")
+            self.assertGreater(wl, 50)
+        finally:
+            r.destroy()
+
+    def test_geometry_within_screen(self):
+        import tkinter as tk
+        from unittest.mock import patch
+        r = tk.Tk()
+        r.withdraw()
+        with patch('ocr_gui.get_dpi_scale', return_value=1.5):
+            from ocr_gui import OCRGuiApp
+            app = OCRGuiApp(r)
+        r.update_idletasks()
+        try:
+            sw = r.winfo_screenwidth()
+            sh = r.winfo_screenheight()
+            w = r.winfo_reqwidth()
+            h = r.winfo_reqheight()
+            # Requested size must be within screen
+            self.assertLessEqual(w, sw + 50)
+            self.assertLessEqual(h, sh + 50)
+        finally:
+            r.destroy()
+
+    def test_no_emoji_in_button_texts(self):
+        import tkinter as tk
+        from unittest.mock import patch
+        import unicodedata
+        r = tk.Tk()
+        r.withdraw()
+        with patch('ocr_gui.get_dpi_scale', return_value=1.0):
+            from ocr_gui import OCRGuiApp
+            app = OCRGuiApp(r)
+        r.update_idletasks()
+        try:
+            btns = [app._btn_start, app._btn_pause, app._btn_resume,
+                    app._btn_cancel, app._btn_cancel_all]
+            for btn in btns:
+                text = btn.cget("text")
+                for ch in text:
+                    cat = unicodedata.category(ch)
+                    # Emoji are typically So (Symbol, other)
+                    self.assertNotEqual(cat, "So",
+                        f"Button '{text}' contains emoji character U+{ord(ch):04X}")
+        finally:
+            r.destroy()
+
+
+# ---------------------------------------------------------------------------
 # Run directly
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":

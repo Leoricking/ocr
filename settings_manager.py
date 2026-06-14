@@ -28,6 +28,11 @@ DEFAULTS = {
     "confidence_threshold": 0.7,
     "preserve_relative_structure": True,
     "window_geometry": "1280x820+100+80",
+    "window_state": "normal",
+    "horizontal_sash_position": 0,
+    "vertical_sash_position": 0,
+    "left_panel_width": 0,
+    "log_panel_height": 0,
     "batch_failure_strategy": "continue",  # "continue" or "stop"
 }
 
