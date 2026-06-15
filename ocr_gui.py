@@ -1,5 +1,5 @@
-# ocr_gui.py — Full tkinter GUI for OCR Engine v4.4.1
-# Window title: OCR Engine v4.4.1 — PDF 搜尋化與品質分析系統
+# ocr_gui.py — Full tkinter GUI for OCR Engine v4.5.4
+# Window title: OCR Engine v4.5.4 — PDF 搜尋化與品質分析系統
 
 import os
 import sys
@@ -11,6 +11,7 @@ import datetime
 import traceback
 import uuid
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from worker_controller import WorkerController, describe_windows_exit_code
 
@@ -73,10 +74,12 @@ def _ensure_ocr_core():
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION = "v4.4.1"
+VERSION = "v4.5.4"
 TITLE = f"OCR Engine {VERSION} — PDF 搜尋化與品質分析系統"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(PROJECT_DIR, "logs")
+
+TIMER_REFRESH_MS = 500
 
 STATUS_COLORS = {
     "等待": "#888888",
@@ -124,6 +127,14 @@ def _count_pdf_pages(path: str) -> int:
         return 0
 
 
+def _format_duration(seconds: float) -> str:
+    """Format a duration in seconds as HH:MM:SS."""
+    s = max(0, int(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{sec:02d}"
+
+
 # ---------------------------------------------------------------------------
 # OCRGuiApp
 # ---------------------------------------------------------------------------
@@ -156,11 +167,19 @@ class OCRGuiApp:
         self._var_gpu_fallback = tk.BooleanVar(value=True)
 
         # State
-        self._batch_items = {}   # file_path -> {index, pages, status, progress, avg_sec, out_pdf, out_txt, out_analysis}
+        self._batch_items = {}   # file_path -> {index, pages, status, progress, avg_sec, elapsed_seconds, out_pdf, out_txt, out_analysis, ...}
         self._batch_order = []   # ordered list of paths
         self._log_lines = []
         self._log_file_handle = None
         self._running = False
+
+        # Batch timing state
+        self._batch_started_at: float = None
+        self._batch_elapsed_seconds: float = 0.0
+        self._batch_finished_at: float = None
+        self._batch_paused_at: float = None
+        self._batch_pause_accumulated: float = 0.0
+        self._timer_id = None
 
         os.makedirs(LOGS_DIR, exist_ok=True)
         self._open_log_file()
@@ -283,11 +302,12 @@ class OCRGuiApp:
             s = self._dpi_scale
             # Fixed-width columns (DPI-scaled)
             fixed = {
-                "編號":    int(40  * s),
-                "頁數":    int(50  * s),
-                "狀態":    int(80  * s),
-                "進度":    int(70  * s),
-                "平均秒/頁": int(75 * s),
+                "編號":      int(40  * s),
+                "頁數":      int(50  * s),
+                "狀態":      int(80  * s),
+                "進度":      int(70  * s),
+                "平均秒/頁":  int(75  * s),
+                "花費時間":   int(110 * s),
             }
             fixed_total = sum(fixed.values())
             scrollbar_w = int(18 * s)
@@ -355,14 +375,21 @@ class OCRGuiApp:
         src_btn_frm.grid(row=0, column=2, padx=(4, 0))
         src_btn_frm.columnconfigure(0, weight=1)
         src_btn_frm.columnconfigure(1, weight=1)
-        ttk.Button(src_btn_frm, text="選擇 PDF", command=self._browse_pdf).grid(
+        src_btn_frm.columnconfigure(2, weight=1)
+
+        # Row 0: 選擇單一 PDF  |  選擇多個 PDF
+        ttk.Button(src_btn_frm, text="選擇單一 PDF", command=self._select_single_pdf).grid(
             row=0, column=0, sticky="ew", padx=1, pady=1)
-        ttk.Button(src_btn_frm, text="選擇資料夾", command=self._browse_input_folder).grid(
+        ttk.Button(src_btn_frm, text="選擇多個 PDF", command=self._select_multiple_pdfs).grid(
             row=0, column=1, sticky="ew", padx=1, pady=1)
-        ttk.Button(src_btn_frm, text="清除來源", command=self._clear_input).grid(
+
+        # Row 1: 選擇資料夾  |  清除來源  |  重新掃描
+        ttk.Button(src_btn_frm, text="選擇資料夾", command=self._browse_input_folder).grid(
             row=1, column=0, sticky="ew", padx=1, pady=1)
-        ttk.Button(src_btn_frm, text="重新掃描", command=self._rescan_batch).grid(
+        ttk.Button(src_btn_frm, text="清除來源", command=self._clear_input).grid(
             row=1, column=1, sticky="ew", padx=1, pady=1)
+        ttk.Button(src_btn_frm, text="重新掃描", command=self._rescan_batch).grid(
+            row=1, column=2, sticky="ew", padx=1, pady=1)
 
         # Row 1: Output
         ttk.Label(frm, text="輸出：").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
@@ -379,10 +406,27 @@ class OCRGuiApp:
         ttk.Button(out_btn_frm, text="開啟輸出資料夾", command=self._open_output_folder).grid(
             row=0, column=1, sticky="ew", padx=1, pady=1)
 
-        # Row 2: Recursive
+        # Row 2: Output mode
+        self._var_output_mode = tk.StringVar(value="all")
+        output_mode_frame = ttk.LabelFrame(frm, text="輸出模式", padding=(8, 5))
+        output_mode_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=(4, 4))
+        for column, (value, label) in enumerate((
+            ("all", "全輸出（PDF + TXT）"),
+            ("pdf", "只輸出 PDF"),
+            ("txt", "只輸出 TXT"),
+        )):
+            ttk.Radiobutton(
+                output_mode_frame,
+                text=label,
+                variable=self._var_output_mode,
+                value=value,
+                command=self._on_output_mode_changed,
+            ).grid(row=0, column=column, sticky="w", padx=(4, 18), pady=3)
+
+        # Row 3: Recursive
         self._var_recursive = tk.BooleanVar()
         ttk.Checkbutton(frm, text="包含子資料夾", variable=self._var_recursive).grid(
-            row=2, column=1, sticky="w", pady=(2, 0)
+            row=3, column=1, sticky="w", pady=(2, 0)
         )
 
     # ---- Main area (settings left, batch list center) ----
@@ -516,21 +560,17 @@ class OCRGuiApp:
         out_frm.columnconfigure(0, weight=1)
         row += 1
 
-        self._var_out_pdf = tk.BooleanVar(value=True)
-        self._var_out_txt = tk.BooleanVar(value=True)
+        # Quality reports remain optional and independent of the primary PDF/TXT mode.
         self._var_out_analysis = tk.BooleanVar(value=True)
         self._var_out_verify = tk.BooleanVar(value=True)
         self._var_preserve = tk.BooleanVar(value=True)
-
-        for var, label in [
-            (self._var_out_pdf, "輸出 PDF"),
-            (self._var_out_txt, "輸出 TXT"),
+        for row_idx, (var, label) in enumerate([
             (self._var_out_analysis, "輸出品質分析"),
             (self._var_out_verify, "輸出校正日誌"),
             (self._var_preserve, "保留相對資料夾結構"),
-        ]:
+        ]):
             ttk.Checkbutton(out_frm, text=label, variable=var).grid(
-                row=out_frm.grid_size()[1], column=0, sticky="w", pady=3
+                row=row_idx, column=0, sticky="w", pady=3
             )
 
         # ---- 5. 檔案處理 ----
@@ -609,12 +649,12 @@ class OCRGuiApp:
         batch_frm.columnconfigure(0, weight=1)
         batch_frm.rowconfigure(0, weight=1)
 
-        cols = ("編號", "檔名", "頁數", "狀態", "進度", "平均秒/頁", "輸出PDF", "輸出TXT", "分析檔")
+        cols = ("編號", "檔名", "頁數", "狀態", "進度", "平均秒/頁", "花費時間", "輸出PDF", "輸出TXT", "分析檔")
         self._tree = ttk.Treeview(batch_frm, columns=cols, show="headings", selectmode="extended")
         s = self._dpi_scale
         col_widths = [
             int(40 * s), int(240 * s), int(50 * s), int(80 * s), int(80 * s),
-            int(80 * s), int(80 * s), int(80 * s), int(80 * s)
+            int(80 * s), int(110 * s), int(80 * s), int(80 * s), int(80 * s)
         ]
         for col, w in zip(cols, col_widths):
             self._tree.heading(col, text=col)
@@ -644,30 +684,56 @@ class OCRGuiApp:
         frm = ttk.LabelFrame(self.root, text="進度", padding=6)
         frm.grid(row=2, column=0, sticky="ew", padx=8, pady=2)
         frm.columnconfigure(1, weight=1)
+        frm.columnconfigure(3, weight=1)
+        frm.columnconfigure(5, weight=1)
 
-        # Current file
+        # Row 0: current file info row
         ttk.Label(frm, text="目前檔案：").grid(row=0, column=0, sticky="w")
-        self._lbl_current_file = ttk.Label(frm, text="—", wraplength=600)
+        self._lbl_current_file = ttk.Label(frm, text="—", wraplength=300)
         self._lbl_current_file.grid(row=0, column=1, sticky="w")
 
+        ttk.Label(frm, text="目前花費：").grid(row=0, column=2, sticky="w", padx=(12, 2))
+        self._lbl_file_elapsed = ttk.Label(frm, text="—")
+        self._lbl_file_elapsed.grid(row=0, column=3, sticky="w")
+
+        ttk.Label(frm, text="目前剩餘：").grid(row=0, column=4, sticky="w", padx=(12, 2))
+        self._lbl_file_remaining = ttk.Label(frm, text="—")
+        self._lbl_file_remaining.grid(row=0, column=5, sticky="w")
+
+        # Row 1: file progress bar
         self._pbar_file = ttk.Progressbar(frm, mode="determinate")
-        self._pbar_file.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        self._pbar_file.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(2, 0))
 
+        # Row 2: page info
         self._lbl_page_info = ttk.Label(frm, text="")
-        self._lbl_page_info.grid(row=2, column=0, columnspan=3, sticky="w")
+        self._lbl_page_info.grid(row=2, column=0, columnspan=6, sticky="w")
 
-        # Overall
+        # Row 3: overall info row
         ttk.Label(frm, text="整體進度：").grid(row=3, column=0, sticky="w", pady=(4, 0))
-        self._pbar_overall = ttk.Progressbar(frm, mode="determinate")
-        self._pbar_overall.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(2, 0))
-
         self._lbl_overall_info = ttk.Label(frm, text="")
-        self._lbl_overall_info.grid(row=5, column=0, columnspan=3, sticky="w")
+        self._lbl_overall_info.grid(row=3, column=1, sticky="w", pady=(4, 0))
 
-        # Worker status row
+        ttk.Label(frm, text="整批花費：").grid(row=3, column=2, sticky="w", padx=(12, 2), pady=(4, 0))
+        self._lbl_batch_elapsed = ttk.Label(frm, text="—")
+        self._lbl_batch_elapsed.grid(row=3, column=3, sticky="w", pady=(4, 0))
+
+        ttk.Label(frm, text="整批剩餘：").grid(row=3, column=4, sticky="w", padx=(12, 2), pady=(4, 0))
+        self._lbl_batch_remaining = ttk.Label(frm, text="—")
+        self._lbl_batch_remaining.grid(row=3, column=5, sticky="w", pady=(4, 0))
+
+        # Row 4: overall progress bar
+        self._pbar_overall = ttk.Progressbar(frm, mode="determinate")
+        self._pbar_overall.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(2, 0))
+
+        # Row 5: ETA row
+        ttk.Label(frm, text="預計完成：").grid(row=5, column=4, sticky="w", padx=(12, 2))
+        self._lbl_eta = ttk.Label(frm, text="—")
+        self._lbl_eta.grid(row=5, column=5, sticky="w")
+
+        # Row 6: Worker status row
         ttk.Label(frm, text="Worker：").grid(row=6, column=0, sticky="w", pady=(4, 0))
         self._lbl_worker_info = ttk.Label(frm, text="—")
-        self._lbl_worker_info.grid(row=6, column=1, columnspan=2, sticky="w", pady=(4, 0))
+        self._lbl_worker_info.grid(row=6, column=1, columnspan=5, sticky="w", pady=(4, 0))
 
     def _build_log_section(self):
         log_frm = ttk.LabelFrame(self.root, text="執行日誌", padding=4)
@@ -739,8 +805,21 @@ class OCRGuiApp:
         self._var_zoom.set(str(s.get("zoom", 3)))
         preprocess_val = s.get("preprocess_mode", "auto")
         self._var_preprocess.set(PREPROCESS_LABELS_REV.get(preprocess_val, "自動選最佳"))
-        self._var_out_pdf.set(s.get("output_pdf", True))
-        self._var_out_txt.set(s.get("output_txt", True))
+        # New v4.5.3 setting.  Migrate old independent booleans safely.
+        output_mode = s.get("output_mode")
+        if output_mode not in {"all", "pdf", "txt"}:
+            old_pdf = bool(s.get("output_pdf", True))
+            old_txt = bool(s.get("output_txt", True))
+            if old_pdf and old_txt:
+                output_mode = "all"
+            elif old_pdf:
+                output_mode = "pdf"
+            elif old_txt:
+                output_mode = "txt"
+            else:
+                # Never start with no primary output selected.
+                output_mode = "all"
+        self._var_output_mode.set(output_mode)
         self._var_out_analysis.set(s.get("output_analysis", True))
         self._var_out_verify.set(s.get("output_verify_log", True))
         self._var_preserve.set(s.get("preserve_relative_structure", True))
@@ -752,6 +831,16 @@ class OCRGuiApp:
         self._var_auto_retry.set(s.get("worker_auto_retry", True))
         self._var_gpu_fallback.set(s.get("worker_gpu_fallback", True))
 
+    def _on_output_mode_changed(self):
+        mode = self._var_output_mode.get()
+        if mode not in {"all", "pdf", "txt"}:
+            mode = "all"
+            self._var_output_mode.set(mode)
+        try:
+            self._sm.save(self._collect_settings())
+        except Exception:
+            pass
+
     def _collect_settings(self) -> dict:
         s = dict(self._settings)
         s["last_input_path"] = self._var_input.get()
@@ -762,8 +851,12 @@ class OCRGuiApp:
         s["claude_model"] = self._var_claude_model.get()
         s["zoom"] = int(self._var_zoom.get())
         s["preprocess_mode"] = PREPROCESS_LABELS.get(self._var_preprocess.get(), "auto")
-        s["output_pdf"] = self._var_out_pdf.get()
-        s["output_txt"] = self._var_out_txt.get()
+        output_mode = self._var_output_mode.get()
+        if output_mode not in {"all", "pdf", "txt"}:
+            output_mode = "all"
+        s["output_mode"] = output_mode
+        s["output_pdf"] = output_mode in {"all", "pdf"}
+        s["output_txt"] = output_mode in {"all", "txt"}
         s["output_analysis"] = self._var_out_analysis.get()
         s["output_verify_log"] = self._var_out_verify.get()
         s["preserve_relative_structure"] = self._var_preserve.get()
@@ -801,21 +894,168 @@ class OCRGuiApp:
         else:
             self._lbl_api_status.config(text="API Key：未設定 (請設定 CLAUDE_API_KEY 環境變數)", foreground="#B71C1C")
 
+    def _is_source_pdf(self, path: str) -> bool:
+        name = os.path.basename(path).lower()
+        if not name.endswith(".pdf"):
+            return False
+        if self._settings.get("exclude_ocr_output", True) and (
+            name.endswith("_ocr.pdf")
+            or name.endswith("_ocr_ocr.pdf")
+            or name.endswith("_searchable.pdf")
+            or name.endswith(".part.pdf")
+        ):
+            return False
+        output = os.path.abspath(self._var_output.get().strip()) if self._var_output.get().strip() else ""
+        if output:
+            try:
+                if os.path.commonpath([os.path.abspath(path), output]) == output:
+                    return False
+            except ValueError:
+                pass
+        return True
+
     # -----------------------------------------------------------------------
-    # Browse helpers
+    # Shared path-adding function (Part A2)
     # -----------------------------------------------------------------------
-    def _browse_pdf(self):
-        path = filedialog.askopenfilename(
-            title="選擇 PDF 檔案",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
+    def _add_pdf_paths_to_batch(self, paths, *, source_kind, clear_existing=False):
+        """Add a list of paths to the batch, with dedup and filtering."""
+        output_dir = ""
+        raw_out = self._var_output.get().strip()
+        if raw_out:
+            try:
+                output_dir = str(Path(raw_out).resolve()).casefold()
+            except Exception:
+                output_dir = raw_out.casefold()
+
+        # Build set of already-known normalized paths for dedup
+        existing_norm = set()
+        for p in self._batch_order:
+            try:
+                existing_norm.add(str(Path(p).resolve()).casefold())
+            except Exception:
+                existing_norm.add(p.casefold())
+
+        added = 0
+        skipped = 0
+        seen_in_selection = set()
+
+        for raw_path in paths:
+            try:
+                norm_path = str(Path(raw_path).resolve()).casefold()
+            except Exception:
+                norm_path = raw_path.casefold()
+
+            abs_path = str(Path(raw_path).resolve()) if raw_path else raw_path
+
+            # Skip non-PDF
+            name_lower = os.path.basename(raw_path).lower()
+            if not name_lower.endswith(".pdf"):
+                skipped += 1
+                continue
+
+            # Skip OCR output / part files
+            if (name_lower.endswith("_ocr.pdf")
+                    or name_lower.endswith("_ocr_ocr.pdf")
+                    or name_lower.endswith("_searchable.pdf")
+                    or name_lower.endswith(".part")):
+                skipped += 1
+                continue
+
+            # Skip files inside the output folder
+            if output_dir:
+                try:
+                    if norm_path.startswith(output_dir):
+                        skipped += 1
+                        continue
+                except Exception:
+                    pass
+
+            # Skip already in batch
+            if norm_path in existing_norm:
+                skipped += 1
+                continue
+
+            # Skip duplicates within this selection
+            if norm_path in seen_in_selection:
+                skipped += 1
+                continue
+            seen_in_selection.add(norm_path)
+
+            # Get page count
+            try:
+                import fitz
+                doc = fitz.open(abs_path)
+                pages = len(doc)
+                doc.close()
+            except Exception as exc:
+                self._append_log(f"[警告] 無法讀取頁數 {os.path.basename(raw_path)}: {exc}")
+                pages = "?"
+
+            idx = len(self._batch_order) + 1
+            display_name = os.path.basename(raw_path)
+            self._batch_order.append(abs_path)
+            existing_norm.add(norm_path)
+            self._batch_items[abs_path] = {
+                "index": idx,
+                "pages": pages,
+                "status": "等待",
+                "progress": "",
+                "avg_sec": "",
+                "elapsed_seconds": 0.0,
+                "file_started_at": None,
+                "file_finished_at": None,
+                "accumulated_pause_seconds": 0.0,
+                "pause_started_at": None,
+                "out_pdf": "",
+                "out_txt": "",
+                "out_analysis": "",
+                "selected": True,
+            }
+            self._tree_insert(abs_path)
+            added += 1
+
+        self._append_log(
+            f"[來源({source_kind})] 加入 {added} 個 PDF，略過 {skipped} 個。"
         )
-        if path:
-            self._var_input.set(path)
-            self._add_files_to_batch([path])
+        self._update_button_states()
+
+    def _update_button_states(self):
+        """Update start button state based on batch contents."""
+        # Currently just ensures start button is normal when not running
+        pass
+
+    # -----------------------------------------------------------------------
+    # Three selection methods (Part A3)
+    # -----------------------------------------------------------------------
+    def _select_single_pdf(self):
+        path = filedialog.askopenfilename(
+            title="選擇單一 PDF",
+            initialdir=self._settings.get("last_input_directory", ""),
+            filetypes=[("PDF 文件", "*.pdf"), ("所有檔案", "*.*")],
+        )
+        if not path:
+            return
+        self._settings["last_input_directory"] = str(Path(path).parent)
+        self._var_input.set(path)
+        self._add_pdf_paths_to_batch([path], source_kind="single")
+
+    def _select_multiple_pdfs(self):
+        paths = filedialog.askopenfilenames(
+            title="選擇多個 PDF",
+            initialdir=self._settings.get("last_input_directory", ""),
+            filetypes=[("PDF 文件", "*.pdf"), ("所有檔案", "*.*")],
+        )
+        if not paths:   # user cancelled → tuple is empty
+            return
+        # paths is a tuple
+        self._settings["last_input_directory"] = str(Path(paths[0]).parent)
+        self._var_input.set(f"已選擇 {len(paths)} 個 PDF")
+        self._add_pdf_paths_to_batch(list(paths), source_kind="multiple")
 
     def _browse_input_folder(self):
         path = filedialog.askdirectory(title="選擇來源資料夾")
         if path:
+            self._settings["last_input_directory"] = str(Path(path))
             self._var_input.set(path)
             self._scan_folder(path)
 
@@ -834,6 +1074,10 @@ class OCRGuiApp:
     def _clear_input(self):
         self._var_input.set("")
 
+    # Legacy browse_pdf kept for backward compat; renamed to _select_single_pdf
+    def _browse_pdf(self):
+        self._select_single_pdf()
+
     # -----------------------------------------------------------------------
     # Batch list management
     # -----------------------------------------------------------------------
@@ -841,35 +1085,21 @@ class OCRGuiApp:
         recursive = self._var_recursive.get()
         files = []
         if recursive:
-            for root, dirs, fnames in os.walk(folder):
+            for root_dir, dirs, fnames in os.walk(folder):
                 for fname in sorted(fnames):
-                    if fname.lower().endswith(".pdf"):
-                        files.append(os.path.join(root, fname))
+                    full = os.path.join(root_dir, fname)
+                    if self._is_source_pdf(full):
+                        files.append(full)
         else:
             for fname in sorted(os.listdir(folder)):
-                if fname.lower().endswith(".pdf"):
-                    files.append(os.path.join(folder, fname))
-        self._add_files_to_batch(files)
+                full = os.path.join(folder, fname)
+                if self._is_source_pdf(full):
+                    files.append(full)
+        self._add_pdf_paths_to_batch(files, source_kind="folder")
 
     def _add_files_to_batch(self, files: list):
-        for path in files:
-            if path not in self._batch_items:
-                idx = len(self._batch_order) + 1
-                self._batch_order.append(path)
-                self._batch_items[path] = {
-                    "index": idx,
-                    "pages": 0,
-                    "status": "等待",
-                    "progress": "",
-                    "avg_sec": "",
-                    "out_pdf": "",
-                    "out_txt": "",
-                    "out_analysis": "",
-                }
-                self._tree_insert(path)
-                # Count pages in background
-                t = threading.Thread(target=self._count_pages_bg, args=(path,), daemon=True)
-                t.start()
+        """Legacy method — delegates to _add_pdf_paths_to_batch."""
+        self._add_pdf_paths_to_batch(files, source_kind="folder")
 
     def _count_pages_bg(self, path: str):
         n = _count_pdf_pages(path)
@@ -882,15 +1112,17 @@ class OCRGuiApp:
 
     def _tree_insert(self, path: str):
         item = self._batch_items[path]
+        pages_val = item["pages"] if item["pages"] != 0 else ""
         self._tree.insert(
             "", "end", iid=path,
             values=(
                 item["index"],
                 os.path.basename(path),
-                item["pages"] or "",
+                pages_val,
                 item["status"],
                 item["progress"],
                 item["avg_sec"],
+                _format_duration(item.get("elapsed_seconds", 0.0)),
                 item["out_pdf"],
                 item["out_txt"],
                 item["out_analysis"],
@@ -901,14 +1133,17 @@ class OCRGuiApp:
         if path not in self._batch_items:
             return
         item = self._batch_items[path]
+        pages_val = item["pages"] if item["pages"] not in (0, "0") else ""
+        elapsed_str = _format_duration(item.get("elapsed_seconds", 0.0))
         try:
             self._tree.item(path, values=(
                 item["index"],
                 os.path.basename(path),
-                item["pages"] or "",
+                pages_val,
                 item["status"],
                 item["progress"],
                 item["avg_sec"],
+                elapsed_str,
                 item["out_pdf"],
                 item["out_txt"],
                 item["out_analysis"],
@@ -977,7 +1212,7 @@ class OCRGuiApp:
         if not item:
             return
         col_idx = int(col.replace("#", "")) - 1
-        cols = ("編號", "檔名", "頁數", "狀態", "進度", "平均秒/頁", "輸出PDF", "輸出TXT", "分析檔")
+        cols = ("編號", "檔名", "頁數", "狀態", "進度", "平均秒/頁", "花費時間", "輸出PDF", "輸出TXT", "分析檔")
         col_name = cols[col_idx] if col_idx < len(cols) else ""
         path = item  # iid is path
         if col_name in ("輸出PDF",):
@@ -1074,6 +1309,106 @@ class OCRGuiApp:
         threading.Thread(target=_run, daemon=True).start()
 
     # -----------------------------------------------------------------------
+    # Timer (Part B3)
+    # -----------------------------------------------------------------------
+    def _start_timer(self):
+        """Start the tick timer, cancelling any existing one first."""
+        if self._timer_id is not None:
+            try:
+                self.root.after_cancel(self._timer_id)
+            except Exception:
+                pass
+            self._timer_id = None
+        self._tick_timer()
+
+    def _stop_timer(self):
+        """Cancel the tick timer."""
+        if self._timer_id is not None:
+            try:
+                self.root.after_cancel(self._timer_id)
+            except Exception:
+                pass
+            self._timer_id = None
+
+    def _tick_timer(self):
+        """Periodic timer to update elapsed time labels and treeview."""
+        now = time.monotonic()
+
+        # Update currently-active file elapsed time in Treeview
+        for path, item in self._batch_items.items():
+            if item["status"] == "OCR 中" and item.get("file_started_at") is not None:
+                if item.get("file_finished_at") is None:
+                    elapsed = (now - item["file_started_at"]
+                               - item.get("accumulated_pause_seconds", 0.0))
+                    item["elapsed_seconds"] = max(0.0, elapsed)
+                    try:
+                        vals = list(self._tree.item(path, "values"))
+                        if len(vals) >= 7:
+                            vals[6] = _format_duration(item["elapsed_seconds"])
+                            self._tree.item(path, values=vals)
+                    except Exception:
+                        pass
+
+        # Compute current file elapsed for progress display
+        cur_file_elapsed = 0.0
+        cur_file_pages_done = 0
+        cur_file_pages_total = 0
+        cur_file_name = "—"
+        for path, item in self._batch_items.items():
+            if item["status"] == "OCR 中":
+                cur_file_elapsed = item.get("elapsed_seconds", 0.0)
+                cur_file_name = os.path.basename(path)
+                # Get page progress
+                prog = item.get("progress", "")
+                if "/" in str(prog):
+                    try:
+                        done, total = str(prog).split("/")
+                        cur_file_pages_done = int(done)
+                        cur_file_pages_total = int(total)
+                    except Exception:
+                        pass
+                break
+
+        self._lbl_current_file.config(text=cur_file_name)
+        self._lbl_file_elapsed.config(text=_format_duration(cur_file_elapsed))
+
+        # Estimate file remaining
+        if cur_file_pages_done > 0 and cur_file_pages_total > cur_file_pages_done:
+            avg_per_page = cur_file_elapsed / cur_file_pages_done
+            pages_left = cur_file_pages_total - cur_file_pages_done
+            file_remaining = avg_per_page * pages_left
+            self._lbl_file_remaining.config(text=_format_duration(file_remaining))
+        else:
+            self._lbl_file_remaining.config(text="—")
+
+        # Batch elapsed
+        if self._batch_started_at is not None:
+            pause_so_far = self._batch_pause_accumulated
+            if self._batch_paused_at is not None:
+                pause_so_far += now - self._batch_paused_at
+            batch_elapsed = now - self._batch_started_at - pause_so_far
+            self._batch_elapsed_seconds = max(0.0, batch_elapsed)
+        self._lbl_batch_elapsed.config(text=_format_duration(self._batch_elapsed_seconds))
+
+        # Batch remaining estimate
+        total_files = len(self._pending_files)
+        done_files = self._completed_file_count
+        if done_files > 0 and self._batch_elapsed_seconds > 0 and total_files > done_files:
+            avg_per_file = self._batch_elapsed_seconds / done_files
+            remaining_files = total_files - done_files
+            batch_remaining = avg_per_file * remaining_files
+            self._lbl_batch_remaining.config(text=_format_duration(batch_remaining))
+            # ETA
+            eta_secs = time.time() + batch_remaining
+            eta_str = datetime.datetime.fromtimestamp(eta_secs).strftime("%H:%M:%S")
+            self._lbl_eta.config(text=eta_str)
+        else:
+            self._lbl_batch_remaining.config(text="—")
+            self._lbl_eta.config(text="—")
+
+        self._timer_id = self.root.after(TIMER_REFRESH_MS, self._tick_timer)
+
+    # -----------------------------------------------------------------------
     # Main OCR batch
     # -----------------------------------------------------------------------
     def _start_batch(self):
@@ -1091,8 +1426,10 @@ class OCRGuiApp:
             messagebox.showerror("錯誤", "請設定輸出路徑。")
             return
         if not os.path.exists(input_path):
-            messagebox.showerror("錯誤", f"來源路徑不存在：\n{input_path}")
-            return
+            # Allow "已選擇 N 個 PDF" virtual path; check actual batch items
+            if not input_path.startswith("已選擇") and not self._batch_order:
+                messagebox.showerror("錯誤", f"來源路徑不存在：\n{input_path}")
+                return
 
         # Collect pending files
         pending = [
@@ -1102,7 +1439,7 @@ class OCRGuiApp:
         if not pending:
             if not self._batch_order:
                 if os.path.isfile(input_path):
-                    self._add_files_to_batch([input_path])
+                    self._add_pdf_paths_to_batch([input_path], source_kind="single")
                 elif os.path.isdir(input_path):
                     self._scan_folder(input_path)
                 pending = [
@@ -1117,7 +1454,18 @@ class OCRGuiApp:
         self._completed_file_count = 0
         self._crash_count = 0
         self._gpu_fallback_active = False
+        self._batch_had_failures = False
+        self._batch_cancelled = False
         self._running = True
+
+        # Start batch timing
+        self._batch_started_at = time.monotonic()
+        self._batch_elapsed_seconds = 0.0
+        self._batch_finished_at = None
+        self._batch_paused_at = None
+        self._batch_pause_accumulated = 0.0
+        self._start_timer()
+
         self._set_running_buttons(True)
         self._lbl_worker_info.config(text="初始化中…")
         self._launch_worker(pending)
@@ -1140,10 +1488,17 @@ class OCRGuiApp:
             "output_txt":  s.get("output_txt", True),
             "output_analysis": s.get("output_analysis", True),
             "output_verify_log": s.get("output_verify_log", True),
+            "output_raw_txt": True,
+            "exclude_ocr_output": s.get("exclude_ocr_output", True),
             "confidence_threshold": round(float(s.get("confidence_threshold", 0.70)), 2),
             "preserve_relative_structure": s.get("preserve_relative_structure", True),
             "claude_model": s.get("claude_model", ""),
             "batch_failure_continue": True,
+            "max_page_pixels": int(s.get("max_page_pixels", 24000000)),
+            "memory_retry_enabled": bool(s.get("memory_retry_enabled", True)),
+            "memory_retry_scales": s.get("memory_retry_scales", [1.0, 0.8, 0.65, 0.5]),
+            "strict_page_failure": bool(s.get("strict_page_failure", False)),
+            "release_between_candidates": bool(s.get("release_between_candidates", True)),
         }
         job = {
             "job_id":    str(uuid.uuid4())[:8],
@@ -1156,6 +1511,7 @@ class OCRGuiApp:
         if not ok:
             self._append_log("[Worker] 無法啟動 Worker 子程序。")
             self._running = False
+            self._stop_timer()
             self._set_running_buttons(False)
             self._lbl_worker_info.config(text="啟動失敗")
             return
@@ -1164,7 +1520,7 @@ class OCRGuiApp:
         self._append_log(f"[Worker] 子程序已啟動，裝置: {mode_str}，{len(files)} 個檔案")
 
     # -----------------------------------------------------------------------
-    # Worker event handler
+    # Worker event handler (Part B2 timing integrated)
     # -----------------------------------------------------------------------
     def _handle_worker_event(self, event: dict):
         """Handle JSON events emitted by WorkerController / ocr_worker.py."""
@@ -1194,7 +1550,23 @@ class OCRGuiApp:
 
         elif etype == "file_started":
             path = event.get("path", "")
+            now = time.monotonic()
+            item = self._batch_items.get(path)
+            if item:
+                item["file_started_at"] = now
+                item["file_finished_at"] = None
+                item["elapsed_seconds"] = 0.0
+                item["accumulated_pause_seconds"] = 0.0
+                item["pause_started_at"] = None
             self._update_file_status(path, "OCR 中", "")
+            # Reset elapsed display
+            try:
+                vals = list(self._tree.item(path, "values"))
+                if len(vals) >= 7:
+                    vals[6] = "00:00:00"
+                    self._tree.item(path, values=vals)
+            except Exception:
+                pass
 
         elif etype == "file_pages":
             path = event.get("path", "")
@@ -1209,7 +1581,21 @@ class OCRGuiApp:
             avg = event.get("avg_sec_per_page", 0.0)
             remaining = event.get("estimated_remaining", 0.0)
             fname = os.path.basename(path)
-            self._lbl_current_file.config(text=fname)
+
+            # Update elapsed for this file
+            item = self._batch_items.get(path)
+            if item:
+                if "elapsed_seconds" in event:
+                    item["elapsed_seconds"] = float(event["elapsed_seconds"])
+                elif item.get("file_started_at") is not None:
+                    now = time.monotonic()
+                    item["elapsed_seconds"] = max(0.0,
+                        now - item["file_started_at"]
+                        - item.get("accumulated_pause_seconds", 0.0))
+                item["progress"] = f"{page + 1}/{total}"
+                item["avg_sec"] = f"{avg:.2f}"
+                self._tree_refresh_row(path)
+
             if total > 0:
                 pct = int((page + 1) / total * 100)
                 self._pbar_file["value"] = pct
@@ -1217,22 +1603,39 @@ class OCRGuiApp:
                 text=(f"第 {page + 1}/{total} 頁  階段：{stage}  "
                       f"平均：{avg:.2f}s/頁  剩餘：{remaining:.0f}s")
             )
-            item = self._batch_items.get(path)
-            if item:
-                item["progress"] = f"{page + 1}/{total}"
-                item["avg_sec"] = f"{avg:.2f}"
-                self._tree_refresh_row(path)
 
         elif etype == "file_completed":
             path = event.get("path", "")
-            self._update_file_status(path, "完成", "")
-            self._completed_file_count += 1
+            now = time.monotonic()
             item = self._batch_items.get(path)
             if item:
+                # Fix final elapsed
+                if "elapsed_seconds" in event:
+                    item["elapsed_seconds"] = float(event["elapsed_seconds"])
+                elif item.get("file_started_at") is not None:
+                    item["elapsed_seconds"] = max(0.0,
+                        now - item["file_started_at"]
+                        - item.get("accumulated_pause_seconds", 0.0))
+                item["file_finished_at"] = now
                 item["out_pdf"] = event.get("pdf", "")
                 item["out_txt"] = event.get("txt", "")
                 item["out_analysis"] = event.get("analysis", "")
-                self._tree_refresh_row(path)
+                pages = item.get("pages", 0)
+                elapsed = item["elapsed_seconds"]
+                avg_speed = (elapsed / pages) if (isinstance(pages, int) and pages > 0) else 0.0
+            self._update_file_status(path, "完成", "")
+            self._completed_file_count += 1
+
+            # Part D: per-file completion log
+            if item:
+                self._append_log(
+                    f"[完成] {os.path.basename(path)}\n"
+                    f"  頁數：{item.get('pages', '?')}\n"
+                    f"  花費時間：{_format_duration(item['elapsed_seconds'])}\n"
+                    f"  平均速度：{avg_speed:.2f} 秒／頁"
+                )
+
+            self._tree_refresh_row(path)
             total = len(self._pending_files)
             pct = int(self._completed_file_count / total * 100) if total else 100
             self._pbar_overall["value"] = pct
@@ -1243,18 +1646,83 @@ class OCRGuiApp:
         elif etype == "file_failed":
             path = event.get("path", "")
             error = event.get("error", "")
+            now = time.monotonic()
+            item = self._batch_items.get(path)
+            if item:
+                if "elapsed_seconds" in event:
+                    item["elapsed_seconds"] = float(event["elapsed_seconds"])
+                elif item.get("file_started_at") is not None:
+                    item["elapsed_seconds"] = max(0.0,
+                        now - item["file_started_at"]
+                        - item.get("accumulated_pause_seconds", 0.0))
+                item["file_finished_at"] = now
             self._update_file_status(path, "失敗", error[:120])
             self._completed_file_count += 1
 
         elif etype == "file_cancelled":
             path = event.get("path", "")
+            item = self._batch_items.get(path)
+            if item and item.get("file_started_at") is not None and item.get("file_finished_at") is None:
+                # Keep current elapsed or zero
+                pass
             self._update_file_status(path, "已取消", "")
+
+        elif etype == "file_skipped":
+            path = event.get("path", "")
+            item = self._batch_items.get(path)
+            if item:
+                item["elapsed_seconds"] = 0.0
+            self._update_file_status(path, "跳過", "")
 
         elif etype == "batch_completed":
             c = event.get("completed", 0)
             f = event.get("failed", 0)
             cn = event.get("cancelled", 0)
-            self._append_log(f"[Worker] 批次完成：{c} 完成，{f} 失敗，{cn} 取消")
+            skipped = event.get("skipped", 0)
+            self._batch_had_failures = f > 0
+            self._batch_cancelled = cn > 0
+
+            # Fix batch elapsed
+            now = time.monotonic()
+            if "elapsed_seconds" in event:
+                self._batch_elapsed_seconds = float(event["elapsed_seconds"])
+            elif self._batch_started_at is not None:
+                pause_total = self._batch_pause_accumulated
+                if self._batch_paused_at is not None:
+                    pause_total += now - self._batch_paused_at
+                self._batch_elapsed_seconds = max(0.0, now - self._batch_started_at - pause_total)
+            self._batch_finished_at = now
+            self._stop_timer()
+
+            processed = c + f + cn + skipped
+            total = max(len(self._pending_files), processed, 1)
+            pct = min(100, int(processed / total * 100))
+            self._pbar_overall["value"] = pct
+            self._lbl_overall_info.config(
+                text=(f"已處理 {processed}/{total}：完成 {c}，失敗 {f}，"
+                      f"取消 {cn}，跳過 {skipped}")
+            )
+            self._lbl_batch_elapsed.config(text=_format_duration(self._batch_elapsed_seconds))
+            self._lbl_batch_remaining.config(text="—")
+            self._lbl_eta.config(text="—")
+
+            # Part D: batch summary log
+            total_pages = sum(
+                item.get("pages", 0) for item in self._batch_items.values()
+                if isinstance(item.get("pages"), int)
+            )
+            avg_per_page = (self._batch_elapsed_seconds / total_pages) if total_pages > 0 else 0.0
+            self._append_log(
+                f"[批次完成]\n"
+                f"  總檔案：{processed}\n"
+                f"  完成：{c}  失敗：{f}  取消：{cn}  跳過：{skipped}\n"
+                f"  整批花費時間：{_format_duration(self._batch_elapsed_seconds)}\n"
+                f"  總處理頁數：{total_pages}\n"
+                f"  平均每頁：{avg_per_page:.2f} 秒"
+            )
+            self._append_log(
+                f"[Worker] 批次完成：{c} 完成，{f} 失敗，{cn} 取消，{skipped} 跳過"
+            )
 
         elif etype == "worker_exited":
             rc = event.get("returncode", 0)
@@ -1263,7 +1731,10 @@ class OCRGuiApp:
             crash_log = event.get("crash_log", "")
             self._append_log(f"[Worker] 子程序結束，exit code: {desc}")
 
-            if rc != 0:
+            if rc in (2, 3):
+                # Controlled completion: 2 means one or more files failed, 3 means cancelled.
+                self._on_worker_done()
+            elif rc != 0:
                 remaining = self._pending_files[self._completed_file_count:]
                 if crash_log:
                     self._append_log(f"[Worker] Crash log: {crash_log}")
@@ -1293,9 +1764,13 @@ class OCRGuiApp:
                 self._on_worker_done()
 
         elif etype == "paused":
+            self._batch_paused_at = time.monotonic()
             self._append_log("[Worker] 已暫停。")
 
         elif etype == "resumed":
+            if self._batch_paused_at is not None:
+                self._batch_pause_accumulated += time.monotonic() - self._batch_paused_at
+                self._batch_paused_at = None
             self._append_log("[Worker] 已繼續。")
 
         elif etype == "controller_error":
@@ -1305,11 +1780,18 @@ class OCRGuiApp:
 
     def _on_worker_done(self):
         self._running = False
+        self._stop_timer()
         self._set_running_buttons(False)
         self._pbar_overall["value"] = 100
         retry_info = f"（崩潰重試 {self._crash_count} 次）" if self._crash_count else ""
-        self._lbl_worker_info.config(text=f"正常完成{retry_info}")
-        self._append_log("[批次] 工作執行緒結束。")
+        if getattr(self, "_batch_cancelled", False):
+            status = "已取消"
+        elif getattr(self, "_batch_had_failures", False):
+            status = "批次完成（含失敗）"
+        else:
+            status = "正常完成"
+        self._lbl_worker_info.config(text=f"{status}{retry_info}")
+        self._append_log(f"[批次] 工作執行緒結束：{status}。")
 
     # -----------------------------------------------------------------------
     # Pause / Cancel
@@ -1317,6 +1799,7 @@ class OCRGuiApp:
     def _pause_batch(self):
         if self._running and self._wc and self._wc.is_running():
             self._wc.pause()
+            self._batch_paused_at = time.monotonic()
             self._btn_pause.config(state="disabled")
             self._btn_resume.config(state="normal")
             self._append_log("[暫停] 已傳送暫停指令。")
@@ -1324,6 +1807,9 @@ class OCRGuiApp:
     def _resume_batch(self):
         if self._wc:
             self._wc.resume()
+            if self._batch_paused_at is not None:
+                self._batch_pause_accumulated += time.monotonic() - self._batch_paused_at
+                self._batch_paused_at = None
             self._btn_pause.config(state="normal")
             self._btn_resume.config(state="disabled")
             self._append_log("[繼續] 已繼續。")
@@ -1450,6 +1936,9 @@ class OCRGuiApp:
             if self._wc:
                 self._wc.force_stop()
             time.sleep(0.5)
+
+        # Cancel timer
+        self._stop_timer()
 
         # Save settings
         try:

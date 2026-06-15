@@ -131,7 +131,7 @@ def process_pdf_with_checkpoint(
 ):
     import fitz
     from ocr_core import (
-        ocr_page_paddle, apply_hard_corrections, align_lines,
+        ocr_page_paddle, apply_safe_corrections, align_lines,
         apply_text_overlay, append_ocr_text, append_quality_analysis,
         log_corrections, FINANCE_KEYWORDS, PHYSICS_KEYWORDS,
         BATCH_SIZE, CONF_SKIP_THRESHOLD, select_engine, engine_prompt,
@@ -147,6 +147,8 @@ def process_pdf_with_checkpoint(
 
     target_pdf = os.path.join(out_dir, stem + "_OCR.pdf")
     target_txt = os.path.join(out_dir, stem + "_OCR.txt")
+    raw_txt = os.path.join(out_dir, stem + "_OCR_raw.txt")
+    corrected_txt = os.path.join(out_dir, stem + "_OCR_corrected.txt")
     analysis_txt = os.path.join(out_dir, stem + "_OCR_analysis.txt")
     log_path = os.path.join(out_dir, "verify_log.txt")
 
@@ -169,7 +171,13 @@ def process_pdf_with_checkpoint(
 
     completed_set = set(cp["completed_pages"])
 
-    ev_started = {"type": "file_started", "path": pdf_path, "index": file_index, "total": file_total}
+    ev_started = {
+        "type": "file_started",
+        "path": pdf_path,
+        "index": file_index,
+        "total": file_total,
+        "started_monotonic": time.monotonic(),
+    }
     _check_encoding(ev_started)
     emit(ev_started)
 
@@ -186,7 +194,7 @@ def process_pdf_with_checkpoint(
 
     # Clear old temp outputs (not checkpoint) if not resuming
     if not completed_set:
-        for p in (target_txt, analysis_txt):
+        for p in (target_txt, raw_txt, corrected_txt, analysis_txt):
             if os.path.exists(p):
                 try:
                     os.remove(p)
@@ -210,14 +218,25 @@ def process_pdf_with_checkpoint(
                     t0 = time.perf_counter()
                     ln, tx, cf, mode = ocr_page_paddle(
                         p, ocr_instance, zoom=config.zoom,
-                        preprocess_mode=config.preprocess_mode
+                        preprocess_mode=config.preprocess_mode,
+                        max_page_pixels=config.max_page_pixels,
+                        memory_retry_enabled=config.memory_retry_enabled,
+                        memory_retry_scales=config.memory_retry_scales,
+                        release_between_candidates=config.release_between_candidates,
                     )
+                    if mode == "FAILED_MEMORY":
+                        emit_log(
+                            f"[記憶體保護] 第 {i + 1} 頁所有候選均失敗，保留原始頁面。"
+                        )
+                        if config.strict_page_failure:
+                            raise MemoryError(f"第 {i + 1} 頁 OCR 記憶體不足")
                     ocr_data.append([ln, tx, cf, config.zoom, mode])
 
                     elapsed = time.perf_counter() - t0
                     page_times.append(elapsed)
                     avg = sum(page_times) / len(page_times)
                     remaining = avg * (total_pages - len(page_times))
+                    file_elapsed = time.perf_counter() - t_file_start
                     emit({
                         "type": "page_progress",
                         "path": pdf_path,
@@ -226,6 +245,7 @@ def process_pdf_with_checkpoint(
                         "stage": "OCR",
                         "preprocess": mode,
                         "elapsed": elapsed,
+                        "elapsed_seconds": file_elapsed,
                         "avg_sec_per_page": avg,
                         "estimated_remaining": remaining,
                     })
@@ -265,7 +285,7 @@ def process_pdf_with_checkpoint(
                 else:
                     emit_log(f"Claude 校對中... {len(batch_pages)} 頁")
                     prompt, timeout = engine_prompt(engine, content_mode)
-                    preprocessed = [apply_hard_corrections(tx) for tx in engine_texts]
+                    preprocessed = [apply_safe_corrections(tx, file_name)[0] for tx in engine_texts]
                     model = config.claude_model if config.claude_model else CLAUDE_MODEL_DEFAULT
                     corrected_pages, uncertain = call_claude_batch(
                         preprocessed, prompt, timeout, claude_model=model
@@ -281,22 +301,29 @@ def process_pdf_with_checkpoint(
                         corrected = engine_texts[j]
                     else:
                         corrected = align_lines(engine_texts[j], corrected)
-                    corrected = apply_hard_corrections(corrected)
+                    final_texts, rule_sources = apply_safe_corrections(corrected, file_name)
+                    sources = [src or ("AI" if a.strip() != b.strip() else "")
+                               for src, a, b in zip(rule_sources, raw_texts, final_texts)]
 
                     if config.output_pdf:
-                        apply_text_overlay(page_obj, lines, corrected, zoom)
+                        apply_text_overlay(page_obj, lines, final_texts, zoom)
                     if config.output_txt:
-                        append_ocr_text(target_txt, page_idx, corrected)
+                        append_ocr_text(target_txt, page_idx, final_texts)
+                        append_ocr_text(corrected_txt, page_idx, final_texts)
+                    if getattr(config, "output_raw_txt", True):
+                        append_ocr_text(raw_txt, page_idx, raw_texts)
                     if config.output_analysis:
                         append_quality_analysis(
                             analysis_txt, file_name, page_idx,
-                            raw_texts, confs, preprocess_mode, corrected
+                            raw_texts, confs, preprocess_mode, final_texts, sources
                         )
                     if config.output_verify_log:
                         log_corrections(
                             log_path, file_name, page_idx,
-                            raw_texts, corrected, disp_engine, ai_enabled=True
+                            raw_texts, final_texts, disp_engine, ai_enabled=True,
+                            correction_sources=sources
                         )
+                    corrected = final_texts
 
                     cp["completed_pages"].append(page_idx)
                     cp["page_texts"][str(page_idx)] = corrected
@@ -316,29 +343,46 @@ def process_pdf_with_checkpoint(
                 t0 = time.perf_counter()
                 lines, raw_texts, confidences, preprocess_mode = ocr_page_paddle(
                     pages[page_num], ocr_instance, zoom=config.zoom,
-                    preprocess_mode=config.preprocess_mode
+                    preprocess_mode=config.preprocess_mode,
+                    max_page_pixels=config.max_page_pixels,
+                    memory_retry_enabled=config.memory_retry_enabled,
+                    memory_retry_scales=config.memory_retry_scales,
+                    release_between_candidates=config.release_between_candidates,
                 )
-                fixed = apply_hard_corrections(raw_texts)
+                if preprocess_mode == "FAILED_MEMORY":
+                    emit_log(
+                        f"[記憶體保護] 第 {page_num + 1} 頁所有候選均失敗，保留原始頁面。"
+                    )
+                    if config.strict_page_failure:
+                        raise MemoryError(f"第 {page_num + 1} 頁 OCR 記憶體不足")
+                    # Do not mark this page completed in the checkpoint; a later rerun may retry it.
+                    continue
+                fixed, sources = apply_safe_corrections(raw_texts, file_name)
 
                 if config.output_pdf:
                     apply_text_overlay(pages[page_num], lines, fixed, config.zoom)
                 if config.output_txt:
                     append_ocr_text(target_txt, page_num, fixed)
+                    append_ocr_text(corrected_txt, page_num, fixed)
+                if getattr(config, "output_raw_txt", True):
+                    append_ocr_text(raw_txt, page_num, raw_texts)
                 if config.output_analysis:
                     append_quality_analysis(
                         analysis_txt, file_name, page_num,
-                        raw_texts, confidences, preprocess_mode, fixed
+                        raw_texts, confidences, preprocess_mode, fixed, sources
                     )
                 if config.output_verify_log:
                     log_corrections(
                         log_path, file_name, page_num,
-                        raw_texts, fixed, "PADDLE", ai_enabled=False
+                        raw_texts, fixed, "PADDLE", ai_enabled=False,
+                        correction_sources=sources
                     )
 
                 elapsed = time.perf_counter() - t0
                 page_times.append(elapsed)
                 avg = sum(page_times) / len(page_times)
                 remaining = avg * (total_pages - len(page_times))
+                file_elapsed = time.perf_counter() - t_file_start
 
                 emit({
                     "type": "page_progress",
@@ -348,6 +392,7 @@ def process_pdf_with_checkpoint(
                     "stage": "PADDLE+RAW",
                     "preprocess": preprocess_mode,
                     "elapsed": elapsed,
+                    "elapsed_seconds": file_elapsed,
                     "avg_sec_per_page": avg,
                     "estimated_remaining": remaining,
                 })
@@ -381,15 +426,20 @@ def process_pdf_with_checkpoint(
             pass
 
         avg_total = sum(page_times) / len(page_times) if page_times else 0
+        total_file_elapsed = time.perf_counter() - t_file_start
         emit({
             "type": "file_completed",
             "path": pdf_path,
             "pdf": target_pdf if config.output_pdf else "",
             "txt": target_txt if config.output_txt else "",
+            "raw_txt": raw_txt if getattr(config, "output_raw_txt", True) else "",
+            "corrected_txt": corrected_txt if config.output_txt else "",
             "analysis": analysis_txt if config.output_analysis else "",
             "avg_sec_per_page": avg_total,
             "total_pages": total_pages,
+            "elapsed_seconds": total_file_elapsed,
         })
+        return True
 
     except Exception as exc:
         # Check if it's an OCRCancelledError
@@ -405,12 +455,15 @@ def process_pdf_with_checkpoint(
                 doc.close()
             except Exception:
                 pass
+            fail_elapsed = time.perf_counter() - t_file_start
             emit({
                 "type": "file_failed",
                 "path": pdf_path,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
+                "elapsed_seconds": fail_elapsed,
             })
+            return False
     finally:
         gc.collect()
 
@@ -441,7 +494,7 @@ def main():
             job = json.load(f)
     except Exception as exc:
         emit({"type": "log", "message": f"[Worker] 無法讀取 job 檔案: {exc}"})
-        emit({"type": "batch_completed", "completed": 0, "failed": 0, "cancelled": 0})
+        emit({"type": "batch_completed", "completed": 0, "failed": 0, "cancelled": 0, "skipped": 0})
         sys.exit(1)
 
     job_id = job.get("job_id", "unknown")
@@ -461,7 +514,7 @@ def main():
         from paddleocr import PaddleOCR
     except Exception as exc:
         emit({"type": "log", "message": f"[Worker] 無法匯入 OCR 核心: {exc}"})
-        emit({"type": "batch_completed", "completed": 0, "failed": 0, "cancelled": 0})
+        emit({"type": "batch_completed", "completed": 0, "failed": 0, "cancelled": 0, "skipped": 0})
         sys.exit(1)
 
     # Build config
@@ -470,7 +523,7 @@ def main():
         config = OCRConfig(**cfg_dict)
     except Exception as exc:
         emit({"type": "log", "message": f"[Worker] OCRConfig 建立失敗: {exc}"})
-        emit({"type": "batch_completed", "completed": 0, "failed": 0, "cancelled": 0})
+        emit({"type": "batch_completed", "completed": 0, "failed": 0, "cancelled": 0, "skipped": 0})
         sys.exit(1)
 
     # GPU availability check
@@ -510,7 +563,7 @@ def main():
             )
     except Exception as exc:
         emit({"type": "log", "message": f"[Worker] PaddleOCR 初始化失敗: {exc}"})
-        emit({"type": "batch_completed", "completed": 0, "failed": 0, "cancelled": 0})
+        emit({"type": "batch_completed", "completed": 0, "failed": 0, "cancelled": 0, "skipped": 0})
         sys.exit(1)
 
     pdf_files = job["pdf_files"]
@@ -523,11 +576,16 @@ def main():
     try:
         for file_index, pdf_path in enumerate(pdf_files):
             try:
-                process_pdf_with_checkpoint(
+                ok = process_pdf_with_checkpoint(
                     pdf_path, config, ocr_instance, checkpoint_dir,
                     control_file, file_index, len(pdf_files), OCRCancelledError
                 )
-                completed += 1
+                if ok:
+                    completed += 1
+                else:
+                    failed += 1
+                    if not config.batch_failure_continue:
+                        break
             except OCRCancelledError:
                 cancelled += 1
                 break
@@ -539,14 +597,20 @@ def main():
     except OCRCancelledError:
         cancelled = len(pdf_files) - completed - failed
 
+    skipped = 0
     emit({
         "type": "batch_completed",
         "completed": completed,
         "failed": failed,
         "cancelled": cancelled,
+        "skipped": skipped,
     })
 
     gc.collect()
+    if cancelled > 0:
+        sys.exit(3)
+    if failed > 0:
+        sys.exit(2)
     sys.exit(0)
 
 

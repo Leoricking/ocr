@@ -22,6 +22,8 @@ LOGS_DIR = os.path.join(PROJECT_DIR, "logs")
 KNOWN_EXIT_CODES = {
     0:            "正常完成",
     1:            "一般錯誤",
+    2:            "批次完成，但有檔案失敗",
+    3:            "使用者取消",
     -1073741819:  "原生程式庫存取違規（CUDA/Paddle/OpenCV/PyMuPDF），Access Violation",
     -1073740791:  "Stack buffer overrun",
     -1073741502:  "DLL 初始化失敗",

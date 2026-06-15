@@ -1,4 +1,4 @@
-# settings_manager.py — GUI settings persistence for OCR Engine v4.5.0
+# settings_manager.py — GUI settings persistence for OCR Engine v4.5.3
 # Settings stored at: C:\Users\Rossi\Documents\Claude\OCR\data\gui_settings.json
 
 import json
@@ -12,6 +12,7 @@ DEFAULTS = {
     "version": 1,
     "last_input_path": "",
     "last_output_path": "",
+    "last_input_directory": "",
     "input_mode": "folder",
     "recursive": False,
     "device": "gpu",
@@ -21,10 +22,12 @@ DEFAULTS = {
     "proofreading_base_url": "http://127.0.0.1:11434",
     "zoom": 3,
     "preprocess_mode": "auto",
+    "output_mode": "all",
     "output_pdf": True,
     "output_txt": True,
     "output_analysis": True,
     "output_verify_log": True,
+    "output_raw_txt": True,
     "overwrite": False,
     "skip_existing": True,
     "confidence_threshold": 0.70,
@@ -36,6 +39,11 @@ DEFAULTS = {
     "window_state": "normal",
     "horizontal_sash_position": 0,
     "batch_failure_strategy": "continue",
+    "max_page_pixels": 24000000,
+    "memory_retry_enabled": True,
+    "memory_retry_scales": [1.0, 0.8, 0.65, 0.5],
+    "strict_page_failure": False,
+    "release_between_candidates": True,
 }
 
 
