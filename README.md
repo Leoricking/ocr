@@ -1,4 +1,4 @@
-# OCR Engine v4.4.2 — PDF 搜尋化與品質分析系統（Worker Process Safety）
+# OCR Engine v4.5.5 — PDF 搜尋化與品質分析系統（Worker Process Safety）
 
 ## 專案功能
 

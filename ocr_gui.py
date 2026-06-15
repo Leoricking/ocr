@@ -1,5 +1,5 @@
-# ocr_gui.py — Full tkinter GUI for OCR Engine v4.5.4
-# Window title: OCR Engine v4.5.4 — PDF 搜尋化與品質分析系統
+# ocr_gui.py — Full tkinter GUI for OCR Engine v4.5.5
+# Window title: OCR Engine v4.5.5 — PDF 搜尋化與品質分析系統
 
 import os
 import sys
@@ -74,7 +74,7 @@ def _ensure_ocr_core():
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION = "v4.5.4"
+VERSION = "v4.5.5"
 TITLE = f"OCR Engine {VERSION} — PDF 搜尋化與品質分析系統"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(PROJECT_DIR, "logs")
@@ -302,21 +302,21 @@ class OCRGuiApp:
             s = self._dpi_scale
             # Fixed-width columns (DPI-scaled)
             fixed = {
-                "編號":      int(40  * s),
-                "頁數":      int(50  * s),
-                "狀態":      int(80  * s),
-                "進度":      int(70  * s),
-                "平均秒/頁":  int(75  * s),
-                "花費時間":   int(110 * s),
+                "index":        int(50  * s),
+                "pages":        int(70  * s),
+                "status":       int(90  * s),
+                "progress":     int(90  * s),
+                "avg_sec":      int(100 * s),
+                "elapsed_time": int(100 * s),
             }
             fixed_total = sum(fixed.values())
             scrollbar_w = int(18 * s)
             remaining = max(0, total - fixed_total - scrollbar_w)
             stretch = {
-                "檔名":   int(remaining * 0.35),
-                "輸出PDF": int(remaining * 0.22),
-                "輸出TXT": int(remaining * 0.22),
-                "分析檔":  int(remaining * 0.21),
+                "filename":   int(remaining * 0.35),
+                "output_pdf": int(remaining * 0.22),
+                "output_txt": int(remaining * 0.22),
+                "analysis":   int(remaining * 0.21),
             }
             for col, w in {**fixed, **stretch}.items():
                 self._tree.column(col, width=max(30, w))
@@ -365,51 +365,42 @@ class OCRGuiApp:
         frm.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 2))
         frm.columnconfigure(1, weight=1)
 
-        # Row 0: Source
+        # Row 0: Source label + entry
         ttk.Label(frm, text="來源：").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self._var_input = tk.StringVar()
-        ttk.Entry(frm, textvariable=self._var_input).grid(row=0, column=1, sticky="ew", padx=2)
+        ttk.Entry(frm, textvariable=self._var_input).grid(row=0, column=1, columnspan=2, sticky="ew", padx=2)
 
-        # Source button sub-frame (two rows)
-        src_btn_frm = ttk.Frame(frm)
-        src_btn_frm.grid(row=0, column=2, padx=(4, 0))
-        src_btn_frm.columnconfigure(0, weight=1)
-        src_btn_frm.columnconfigure(1, weight=1)
-        src_btn_frm.columnconfigure(2, weight=1)
+        # Row 1: Source buttons (single toolbar row)
+        source_button_frame = ttk.Frame(frm)
+        source_button_frame.grid(row=1, column=1, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Button(source_button_frame, text="選擇單一 PDF", width=14,
+                   command=self._select_single_pdf).grid(row=0, column=0, padx=(0, 6), pady=1)
+        ttk.Button(source_button_frame, text="選擇多個 PDF", width=14,
+                   command=self._select_multiple_pdfs).grid(row=0, column=1, padx=(0, 6), pady=1)
+        ttk.Button(source_button_frame, text="選擇資料夾", width=12,
+                   command=self._browse_input_folder).grid(row=0, column=2, padx=(0, 6), pady=1)
+        ttk.Button(source_button_frame, text="清除來源", width=10,
+                   command=self._clear_input).grid(row=0, column=3, padx=(0, 6), pady=1)
+        ttk.Button(source_button_frame, text="重新掃描", width=10,
+                   command=self._rescan_batch).grid(row=0, column=4, padx=(0, 0), pady=1)
 
-        # Row 0: 選擇單一 PDF  |  選擇多個 PDF
-        ttk.Button(src_btn_frm, text="選擇單一 PDF", command=self._select_single_pdf).grid(
-            row=0, column=0, sticky="ew", padx=1, pady=1)
-        ttk.Button(src_btn_frm, text="選擇多個 PDF", command=self._select_multiple_pdfs).grid(
-            row=0, column=1, sticky="ew", padx=1, pady=1)
-
-        # Row 1: 選擇資料夾  |  清除來源  |  重新掃描
-        ttk.Button(src_btn_frm, text="選擇資料夾", command=self._browse_input_folder).grid(
-            row=1, column=0, sticky="ew", padx=1, pady=1)
-        ttk.Button(src_btn_frm, text="清除來源", command=self._clear_input).grid(
-            row=1, column=1, sticky="ew", padx=1, pady=1)
-        ttk.Button(src_btn_frm, text="重新掃描", command=self._rescan_batch).grid(
-            row=1, column=2, sticky="ew", padx=1, pady=1)
-
-        # Row 1: Output
-        ttk.Label(frm, text="輸出：").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
+        # Row 2: Output label + entry
+        ttk.Label(frm, text="輸出：").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
         self._var_output = tk.StringVar()
-        ttk.Entry(frm, textvariable=self._var_output).grid(row=1, column=1, sticky="ew", padx=2, pady=(4, 0))
+        ttk.Entry(frm, textvariable=self._var_output).grid(row=2, column=1, columnspan=2, sticky="ew", padx=2, pady=(4, 0))
 
-        # Output button sub-frame
-        out_btn_frm = ttk.Frame(frm)
-        out_btn_frm.grid(row=1, column=2, padx=(4, 0), pady=(4, 0))
-        out_btn_frm.columnconfigure(0, weight=1)
-        out_btn_frm.columnconfigure(1, weight=1)
-        ttk.Button(out_btn_frm, text="選擇輸出資料夾", command=self._browse_output_folder).grid(
-            row=0, column=0, sticky="ew", padx=1, pady=1)
-        ttk.Button(out_btn_frm, text="開啟輸出資料夾", command=self._open_output_folder).grid(
-            row=0, column=1, sticky="ew", padx=1, pady=1)
+        # Row 3: Output buttons (single toolbar row)
+        output_button_frame = ttk.Frame(frm)
+        output_button_frame.grid(row=3, column=1, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Button(output_button_frame, text="選擇輸出資料夾", width=14,
+                   command=self._browse_output_folder).grid(row=0, column=0, padx=(0, 6), pady=1)
+        ttk.Button(output_button_frame, text="開啟輸出資料夾", width=14,
+                   command=self._open_output_folder).grid(row=0, column=1, padx=(0, 0), pady=1)
 
-        # Row 2: Output mode
+        # Row 4: Output mode (kept as-is from v4.5.3)
         self._var_output_mode = tk.StringVar(value="all")
         output_mode_frame = ttk.LabelFrame(frm, text="輸出模式", padding=(8, 5))
-        output_mode_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=(4, 4))
+        output_mode_frame.grid(row=4, column=0, columnspan=3, sticky="ew", padx=6, pady=(4, 4))
         for column, (value, label) in enumerate((
             ("all", "全輸出（PDF + TXT）"),
             ("pdf", "只輸出 PDF"),
@@ -423,10 +414,10 @@ class OCRGuiApp:
                 command=self._on_output_mode_changed,
             ).grid(row=0, column=column, sticky="w", padx=(4, 18), pady=3)
 
-        # Row 3: Recursive
+        # Row 5: Recursive
         self._var_recursive = tk.BooleanVar()
         ttk.Checkbutton(frm, text="包含子資料夾", variable=self._var_recursive).grid(
-            row=3, column=1, sticky="w", pady=(2, 0)
+            row=5, column=1, sticky="w", pady=(2, 0)
         )
 
     # ---- Main area (settings left, batch list center) ----
@@ -649,16 +640,40 @@ class OCRGuiApp:
         batch_frm.columnconfigure(0, weight=1)
         batch_frm.rowconfigure(0, weight=1)
 
-        cols = ("編號", "檔名", "頁數", "狀態", "進度", "平均秒/頁", "花費時間", "輸出PDF", "輸出TXT", "分析檔")
+        cols = ("index", "filename", "pages", "status", "progress",
+                "avg_sec", "elapsed_time", "output_pdf", "output_txt", "analysis")
+        col_labels = {
+            "index":        "編號",
+            "filename":     "檔名",
+            "pages":        "頁數",
+            "status":       "狀態",
+            "progress":     "進度",
+            "avg_sec":      "平均秒/頁",
+            "elapsed_time": "花費時間",
+            "output_pdf":   "輸出PDF",
+            "output_txt":   "輸出TXT",
+            "analysis":     "分析檔",
+        }
+        # heading anchor / column anchor / width / stretch
+        col_specs = {
+            "index":        ("center", "center", 50,  False),
+            "filename":     ("center", "w",      270, True),
+            "pages":        ("center", "center", 70,  False),
+            "status":       ("center", "center", 90,  False),
+            "progress":     ("center", "center", 90,  False),
+            "avg_sec":      ("center", "center", 100, False),
+            "elapsed_time": ("center", "center", 100, False),
+            "output_pdf":   ("center", "w",      180, True),
+            "output_txt":   ("center", "w",      180, True),
+            "analysis":     ("center", "w",      180, True),
+        }
         self._tree = ttk.Treeview(batch_frm, columns=cols, show="headings", selectmode="extended")
         s = self._dpi_scale
-        col_widths = [
-            int(40 * s), int(240 * s), int(50 * s), int(80 * s), int(80 * s),
-            int(80 * s), int(110 * s), int(80 * s), int(80 * s), int(80 * s)
-        ]
-        for col, w in zip(cols, col_widths):
-            self._tree.heading(col, text=col)
-            self._tree.column(col, width=w, minwidth=30)
+        for col in cols:
+            h_anchor, c_anchor, base_w, stretch = col_specs[col]
+            w = int(base_w * s)
+            self._tree.heading(col, text=col_labels[col], anchor=h_anchor)
+            self._tree.column(col, width=w, minwidth=30, anchor=c_anchor, stretch=stretch)
 
         vsb = ttk.Scrollbar(batch_frm, orient="vertical", command=self._tree.yview)
         hsb = ttk.Scrollbar(batch_frm, orient="horizontal", command=self._tree.xview)
@@ -1212,18 +1227,19 @@ class OCRGuiApp:
         if not item:
             return
         col_idx = int(col.replace("#", "")) - 1
-        cols = ("編號", "檔名", "頁數", "狀態", "進度", "平均秒/頁", "花費時間", "輸出PDF", "輸出TXT", "分析檔")
+        cols = ("index", "filename", "pages", "status", "progress",
+                "avg_sec", "elapsed_time", "output_pdf", "output_txt", "analysis")
         col_name = cols[col_idx] if col_idx < len(cols) else ""
         path = item  # iid is path
-        if col_name in ("輸出PDF",):
+        if col_name == "output_pdf":
             val = self._batch_items.get(path, {}).get("out_pdf", "")
             if val and os.path.exists(val):
                 _open_path(val)
-        elif col_name in ("輸出TXT",):
+        elif col_name == "output_txt":
             val = self._batch_items.get(path, {}).get("out_txt", "")
             if val and os.path.exists(val):
                 _open_path(val)
-        elif col_name in ("分析檔",):
+        elif col_name == "analysis":
             val = self._batch_items.get(path, {}).get("out_analysis", "")
             if val and os.path.exists(val):
                 _open_path(val)
