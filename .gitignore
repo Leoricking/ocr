@@ -1,45 +1,76 @@
-﻿# Python cache
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Virtual environments
 .venv/
 venv/
 env/
 
-# Local IDE / AI settings
-.claude/
+# IDE / OS
 .vscode/
 .idea/
-
-# Secrets and environment variables
-.env
-.env.*
-!.env.example
-
-# Local environment snapshots
-requirements-working.txt
-
-# External installers and binaries
-VC_redist.x64.exe
-*.exe
-
-# Private / copyrighted test materials
-test/
-tests/input/
-tests/output/
-
-# OCR generated output
-output/
-*_OCR.pdf
-*_OCR.txt
-ocr_process_log.txt
-verify_log.txt
-
-# Temporary files
-*.tmp
-*.temp
-~$*
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# OCR runtime data
+data/
+logs/
+output/
+outputs/
+runtime/
+checkpoints/
+.ocr_state/
+*.control.json
+batch_result_*.json
+gui_settings.json
+gui_settings.broken.json
+
+# OCR generated files
+*_OCR.pdf
+*_OCR_OCR.pdf
+*_searchable.pdf
+*_OCR.txt
+*_OCR_raw.txt
+*_OCR_corrected.txt
+*_OCR_analysis.txt
+verify_log.txt
+*.part
+*.part.pdf
+
+# Local test/output assets
+test/output/
+test/**/*.pdf
+test/**/*.txt
+
+# Local notes / temporary files
+commit_msg.txt
+OCR_v4.3.0_修改與校正分析.txt
+
+# Legacy local install documents now merged into README.md
+Install OCR GPU.md
+Install_OCR_GPU.md
+Install_old.txt
+Install_v4.1.2.txt
+CHANGELOG_v4.5.3.md
+CHANGELOG_v4.5.4.md
+CHANGELOG_v4.5.5.md
+
+# Archives / packages
+*.zip
+*.7z
+*.rar
+
+# Local Claude Code settings
+.claude/
+
+# Local installer and environment snapshot
+VC_redist.x64.exe
+requirements-working.txt
