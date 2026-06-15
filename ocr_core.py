@@ -1,4 +1,4 @@
-# ocr_core.py — Shared OCR core for OCR Engine v4.4.0
+# ocr_core.py — Shared OCR core for OCR Engine v4.5.2
 # All OCR logic, constants, helpers, and the OCRProcessor class live here.
 # This module must be imported BEFORE PaddleOCR is imported anywhere else,
 # because the GPU DLL search-path setup must happen first.
@@ -14,7 +14,7 @@ import importlib.metadata as _meta
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Optional, List
+from typing import Callable, Optional, List, Tuple, Dict
 
 # ==============================================================
 # Windows GPU DLL search-path setup
@@ -125,10 +125,17 @@ class OCRConfig:
     output_txt: bool = True
     output_analysis: bool = True
     output_verify_log: bool = True
+    output_raw_txt: bool = True
+    exclude_ocr_output: bool = True
     confidence_threshold: float = 0.70
     preserve_relative_structure: bool = True
     claude_model: str = ""                  # empty → use CLAUDE_MODEL env var
     batch_failure_continue: bool = True
+    max_page_pixels: int = 24_000_000
+    memory_retry_enabled: bool = True
+    memory_retry_scales: list = field(default_factory=lambda: [1.0, 0.8, 0.65, 0.5])
+    strict_page_failure: bool = False
+    release_between_candidates: bool = True
 
 
 # ==============================================================
@@ -337,21 +344,47 @@ def _load_surya():
 FINANCE_KEYWORDS = ['股市', '理財', '周刊', '週刊', '基金', '投資', '財經']
 PHYSICS_KEYWORDS = ['公式', '向量', '電磁', '物理', 'LaTeX', '微積分', '電場', '磁場']
 
-HARD_CODED_CORRECTIONS = {
-    "白大": "台大",
-    "輻樹聲": "賴樹聲",
-    "貨格考": "資格考",
-    "F-ma": "F=ma",
-    "貨格": "價格",
-    "訊號土": "訊號±",
-    "聶": "",
-    "畢吳": "",
-    "理輪": "理論",
-    "梨力學": "熱力學",
-    "電形學": "電磁學",
-    "衣捲": "交卷",
-    "D.Eardley日基研nt": "D. Eardley 研一下",
+# Safe correction rules.  Rules are deliberately scoped to exact lines,
+# exact phrases, or a specific document.  Do not add broad single-character
+# replacements here because they can silently corrupt valid names/formulas.
+EXACT_LINE_CORRECTIONS: Dict[str, str] = {
+    "股價漲多就有懼高痘?": "股價漲多就有懼高症？",
+    "日時寺間]是什麼?": "「時間」是什麼？",
+    "T時間]是什麼?": "「時間」是什麼？",
+    "http://ww.inewton.com.tw": "http://www.inewton.com.tw",
 }
+
+EXACT_PHRASE_CORRECTIONS: Dict[str, str] = {
+    "懼高痘": "懼高症",
+    "http://ww.inewton.com.tw": "http://www.inewton.com.tw",
+}
+
+DOCUMENT_SPECIFIC_CORRECTIONS: Dict[str, Dict[str, str]] = {
+    "今周刊：摸透主力思維": {
+        "股價漲多就有懼高痘?": "股價漲多就有懼高症？",
+    },
+    "賴樹聲 電磁波": {
+        "合大物理系第一名畢業": "台大物理系第一名畢業",
+        "1977白大物理採第一名畢業": "1977台大物理系第一名畢業",
+        "記得吃古大物理不時門大於必修籠磁學": "記得唸台大物理系時，大二必修電磁學",
+    },
+    "Newton牛頓科學2009年8月第22期 「時間」是什麼": {
+        "日時寺間]是什麼?": "「時間」是什麼？",
+        "T時間]是什麼?": "「時間」是什麼？",
+        "http://ww.inewton.com.tw": "http://www.inewton.com.tw",
+    },
+}
+
+CONTEXT_CORRECTIONS = [
+    # Only correct this phrase when the surrounding page clearly discusses
+    # probability/gambling.  This avoids a dangerous global replacement.
+    ({"機率", "賭"}, "王萬要賭後", "千萬不要賭"),
+]
+
+OCR_OUTPUT_SUFFIXES = (
+    "_ocr.pdf", "_ocr_ocr.pdf", "_searchable.pdf", ".part",
+)
+
 
 # ==============================================================
 # Claude prompts
@@ -421,17 +454,80 @@ def _page_to_bgr(page, zoom: int):
     return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
 
-def _preprocess_variants(image_bgr):
+def _is_memory_error(exc: BaseException) -> bool:
+    """Return True for Python/NumPy/OpenCV/Paddle allocation failures."""
+    if isinstance(exc, MemoryError):
+        return True
+    msg = str(exc).lower()
+    tokens = (
+        "unable to allocate", "bad allocation", "std::bad_alloc",
+        "out of memory", "outofmemory", "resource exhausted",
+        "cuda error: out of memory", "cuda out of memory",
+    )
+    return any(token in msg for token in tokens)
+
+
+def _release_memory(use_gpu: bool = False):
+    """Best-effort release of Python and optional Paddle GPU caches."""
+    import gc
+    gc.collect()
+    if use_gpu:
+        try:
+            import paddle
+            if paddle.is_compiled_with_cuda():
+                paddle.device.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _effective_zoom_for_page(page, requested_zoom: float, max_page_pixels: int) -> float:
+    """Cap render size without changing the user's persisted zoom setting."""
+    requested_zoom = max(float(requested_zoom), 1.0)
+    base_pixels = max(float(page.rect.width) * float(page.rect.height), 1.0)
+    requested_pixels = base_pixels * requested_zoom * requested_zoom
+    if not max_page_pixels or requested_pixels <= max_page_pixels:
+        return requested_zoom
+    safe = (float(max_page_pixels) / base_pixels) ** 0.5
+    return max(1.5, min(requested_zoom, safe))
+
+
+def _build_preprocess_candidate(image_bgr, mode: str):
+    """Build one candidate at a time to avoid holding RAW/CLAHE/BINARY together."""
+    mode = mode.upper()
+    if mode == "ORIGINAL":
+        return image_bgr
+
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    denoised = cv2.fastNlMeansDenoising(gray, None, h=7, templateWindowSize=7, searchWindowSize=21)
-    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-    contrast = clahe.apply(denoised)
-    blur = cv2.GaussianBlur(contrast, (0, 0), 1.0)
-    sharpened = cv2.addWeighted(contrast, 1.45, blur, -0.45, 0)
-    binary = cv2.adaptiveThreshold(sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 13)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    return {"ORIGINAL": image_bgr, "CLAHE": sharpened, "BINARY": binary}
+    try:
+        denoised = cv2.fastNlMeansDenoising(
+            gray, None, h=7, templateWindowSize=7, searchWindowSize=21
+        )
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+        contrast = clahe.apply(denoised)
+        blur = cv2.GaussianBlur(contrast, (0, 0), 1.0)
+        sharpened = cv2.addWeighted(contrast, 1.45, blur, -0.45, 0)
+        if mode == "CLAHE":
+            return sharpened
+        binary = cv2.adaptiveThreshold(
+            sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 35, 13
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+        return cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    finally:
+        # Local temporaries not returned are released on scope exit.
+        pass
+
+
+def _scale_ocr_lines(lines, scale: float):
+    if not lines or abs(scale - 1.0) < 1e-9:
+        return lines
+    scaled = []
+    for line in lines:
+        box, payload = line[0], line[1]
+        new_box = [[float(p[0]) * scale, float(p[1]) * scale] for p in box]
+        scaled.append([new_box, payload])
+    return scaled
 
 
 # ==============================================================
@@ -532,37 +628,125 @@ def _candidate_score(texts, confidences):
 # ==============================================================
 # OCR page functions
 # ==============================================================
-def ocr_page_paddle(page, ocr, zoom: int = 3, preprocess_mode: str = "auto"):
-    """Run PaddleOCR on a page. preprocess_mode: auto|original|clahe|binary."""
-    image = _page_to_bgr(page, zoom)
-    page_width = image.shape[1]
-    variants = _preprocess_variants(image)
+def ocr_page_paddle(
+    page, ocr, zoom: int = 3, preprocess_mode: str = "auto",
+    max_page_pixels: int = 24_000_000,
+    memory_retry_enabled: bool = True,
+    memory_retry_scales=None,
+    release_between_candidates: bool = True,
+):
+    """Run PaddleOCR with sequential candidates and memory-safe zoom fallback.
 
-    if preprocess_mode != "auto":
-        key_map = {"original": "ORIGINAL", "clahe": "CLAHE", "binary": "BINARY"}
-        key = key_map.get(preprocess_mode.lower(), "ORIGINAL")
-        selected = {key: variants.get(key, image)}
-    else:
-        selected = variants
+    The returned line coordinates are scaled back to the originally requested zoom,
+    so existing overlay code remains compatible.
+    """
+    requested_zoom = float(zoom)
+    retry_scales = list(memory_retry_scales or [1.0, 0.8, 0.65, 0.5])
+    if not memory_retry_enabled:
+        retry_scales = [1.0]
 
-    best = None
-    for mode, candidate in selected.items():
-        ok, encoded = cv2.imencode(".png", candidate)
-        if not ok:
-            continue
+    base_zoom = _effective_zoom_for_page(page, requested_zoom, int(max_page_pixels or 0))
+    attempts = []
+    for factor in retry_scales:
+        candidate_zoom = max(1.5, min(requested_zoom, base_zoom * float(factor)))
+        if not attempts or abs(candidate_zoom - attempts[-1]) > 1e-6:
+            attempts.append(candidate_zoom)
+
+    if base_zoom < requested_zoom:
+        print(
+            f"  [記憶體保護] Zoom {requested_zoom:g} 已調整為 {base_zoom:.2f} "
+            f"（頁面像素上限 {int(max_page_pixels):,}）"
+        )
+
+    last_memory_error = None
+    mode_map = {"original": "ORIGINAL", "clahe": "CLAHE", "binary": "BINARY"}
+    modes = [mode_map.get(preprocess_mode.lower(), "ORIGINAL")] if preprocess_mode != "auto" else [
+        "ORIGINAL", "CLAHE", "BINARY"
+    ]
+
+    for attempt_index, effective_zoom in enumerate(attempts, start=1):
+        image = None
         try:
-            result = ocr.ocr(encoded.tobytes(), cls=True)
-        except Exception as exc:
-            print(f"\n  [!] {mode} OCR 失敗：{exc}")
-            continue
-        lines, texts, confidences = _normalize_ocr_result(result, page_width)
-        score = _candidate_score(texts, confidences)
-        if best is None or score > best["score"]:
-            best = {"mode": mode, "score": score, "lines": lines, "texts": texts, "confidences": confidences}
-    if best is None:
-        return [], [], [], "FAILED"
-    return best["lines"], best["texts"], best["confidences"], best["mode"]
+            image = _page_to_bgr(page, effective_zoom)
+            page_width = image.shape[1]
+            best = None
+            memory_failures = 0
 
+            for mode in modes:
+                candidate = None
+                encoded = None
+                raw_result = None
+                try:
+                    candidate = _build_preprocess_candidate(image, mode)
+                    ok, encoded = cv2.imencode(".png", candidate)
+                    if not ok:
+                        continue
+                    raw_result = ocr.ocr(encoded.tobytes(), cls=True)
+                    lines, texts, confidences = _normalize_ocr_result(raw_result, page_width)
+                    score = _candidate_score(texts, confidences)
+                    compact = {
+                        "mode": mode,
+                        "score": score,
+                        "lines": lines,
+                        "texts": texts,
+                        "confidences": confidences,
+                    }
+                    if best is None or score > best["score"]:
+                        best = compact
+                except Exception as exc:
+                    if _is_memory_error(exc):
+                        memory_failures += 1
+                        last_memory_error = exc
+                        print(f"\n  [!] {mode} OCR 記憶體不足：{exc}")
+                    else:
+                        print(f"\n  [!] {mode} OCR 失敗：{exc}")
+                finally:
+                    raw_result = None
+                    encoded = None
+                    if candidate is not image:
+                        candidate = None
+                    if release_between_candidates:
+                        _release_memory(use_gpu=False)
+
+            if best is not None:
+                # Existing overlay divides coordinates by requested zoom. Scale boxes
+                # accordingly when a lower effective zoom was used.
+                scale = requested_zoom / effective_zoom
+                lines = _scale_ocr_lines(best["lines"], scale)
+                if effective_zoom < requested_zoom:
+                    print(
+                        f"  [記憶體保護] Zoom {effective_zoom:.2f} 成功，"
+                        f"採用 {best['mode']} 結果"
+                    )
+                return lines, best["texts"], best["confidences"], best["mode"]
+
+            if memory_failures and attempt_index < len(attempts):
+                print(
+                    f"  [記憶體保護] Zoom {effective_zoom:.2f} 無可用候選，"
+                    f"將以 Zoom {attempts[attempt_index]:.2f} 重試"
+                )
+                _release_memory(use_gpu=True)
+                continue
+            break
+        except Exception as exc:
+            if _is_memory_error(exc):
+                last_memory_error = exc
+                if attempt_index < len(attempts):
+                    print(
+                        f"  [記憶體保護] Zoom {effective_zoom:.2f} 記憶體不足，"
+                        f"將以 Zoom {attempts[attempt_index]:.2f} 重試：{exc}"
+                    )
+                    _release_memory(use_gpu=True)
+                    continue
+            raise
+        finally:
+            image = None
+            _release_memory(use_gpu=False)
+
+    if last_memory_error is not None:
+        print(f"  [記憶體保護] 所有降級嘗試均失敗：{last_memory_error}")
+        return [], [], [], "FAILED_MEMORY"
+    return [], [], [], "FAILED"
 
 def ocr_texts_nougat(page, zoom: int = 3) -> list:
     try:
@@ -609,13 +793,55 @@ def engine_prompt(engine: str, content_mode: str) -> tuple:
     return PROMPT_PADDLE_DEFAULT, API_TIMEOUT_DEFAULT
 
 
-def apply_hard_corrections(texts: list) -> list:
-    result = []
-    for t in texts:
-        for wrong, right in HARD_CODED_CORRECTIONS.items():
-            t = t.replace(wrong, right)
-        result.append(t)
-    return result
+def _document_key(file_name: str) -> str:
+    stem = os.path.splitext(os.path.basename(file_name or ""))[0]
+    while stem.lower().endswith("_ocr"):
+        stem = stem[:-4]
+    return stem
+
+
+def _formula_dense(text: str) -> bool:
+    symbols = sum(ch in "=+-*/^_()[]{}λβωηΓπ∞∇×·" for ch in text)
+    return symbols >= 3 or "\\" in text or "$" in text
+
+
+def apply_safe_corrections(texts: list, file_name: str = "") -> Tuple[list, list]:
+    """Apply conservative corrections and return (texts, sources).
+
+    sources contains an empty string for unchanged lines, otherwise a short
+    rule identifier.  Formula-dense lines are left untouched unless the whole
+    line is an exact verified match.
+    """
+    doc_key = _document_key(file_name)
+    doc_rules = DOCUMENT_SPECIFIC_CORRECTIONS.get(doc_key, {})
+    page_context = " ".join(str(t) for t in texts)
+    result, sources = [], []
+    for original in texts:
+        text = str(original)
+        source = ""
+        if text in doc_rules:
+            text = doc_rules[text]
+            source = f"document:{doc_key}"
+        elif text in EXACT_LINE_CORRECTIONS:
+            text = EXACT_LINE_CORRECTIONS[text]
+            source = "exact-line"
+        elif not _formula_dense(text):
+            for wrong, right in EXACT_PHRASE_CORRECTIONS.items():
+                if wrong in text:
+                    text = text.replace(wrong, right)
+                    source = "exact-phrase"
+            for required, wrong, right in CONTEXT_CORRECTIONS:
+                if wrong in text and all(token in page_context for token in required):
+                    text = text.replace(wrong, right)
+                    source = "context"
+        result.append(text)
+        sources.append(source)
+    return result, sources
+
+
+def apply_hard_corrections(texts: list, file_name: str = "") -> list:
+    """Backward-compatible wrapper for older callers."""
+    return apply_safe_corrections(texts, file_name)[0]
 
 
 def align_lines(original: list, corrected: list) -> list:
@@ -763,9 +989,10 @@ def _suspicious_reasons(text: str, confidence: float) -> list:
     return reasons
 
 
-def append_quality_analysis(analysis_path, file_name, page_num, texts, confidences, preprocess_mode, corrected_texts=None):
+def append_quality_analysis(analysis_path, file_name, page_num, texts, confidences, preprocess_mode, corrected_texts=None, correction_sources=None):
     confidences = confidences or []
     corrected_texts = corrected_texts or texts
+    correction_sources = correction_sources or [""] * len(texts)
     avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
     low_count = sum(1 for value in confidences if value < 0.70)
     medium_count = sum(1 for value in confidences if 0.70 <= value < 0.82)
@@ -774,8 +1001,9 @@ def append_quality_analysis(analysis_path, file_name, page_num, texts, confidenc
         confidence = confidences[index] if index < len(confidences) else 0.0
         reasons = _suspicious_reasons(text, confidence)
         corrected = corrected_texts[index] if index < len(corrected_texts) else text
+        source = correction_sources[index] if index < len(correction_sources) else ""
         if corrected.strip() != text.strip():
-            reasons.append("已被規則或 AI 校正")
+            reasons.append(f"已校正（{source or 'AI/規則'}）")
         if reasons:
             issues.append((index + 1, confidence, text.strip(), corrected.strip(), "；".join(reasons)))
     with open(analysis_path, "a", encoding="utf-8-sig") as handle:
@@ -805,24 +1033,30 @@ def append_quality_analysis(analysis_path, file_name, page_num, texts, confidenc
             handle.write("\n需修改／校正部分：無明顯項目。\n")
 
 
-def log_corrections(log_path, file_name, page_num, original, corrected, engine, ai_enabled):
+def log_corrections(log_path, file_name, page_num, original, corrected, engine, ai_enabled, correction_sources=None):
+    """Write only actual changes; raw OCR belongs in *_OCR_raw.txt."""
+    correction_sources = correction_sources or [""] * len(original)
     entries = []
-    if ai_enabled:
-        for orig, corr in zip(original, corrected):
-            o, c = orig.strip(), corr.strip()
-            if o != c:
-                entries.append(f"  原始: {o}\n  修正: {c}")
-    else:
-        for orig in original:
-            o = orig.strip()
-            if o:
-                entries.append(f"  OCR : {o}  →  [Raw OCR]")
-    if entries:
-        ai_tag = "AI校對" if ai_enabled else "Raw OCR"
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n[{datetime.now().strftime('%H:%M:%S')}] {file_name}"
-                    f" 第 {page_num + 1} 頁  [{engine}+{ai_tag}]\n")
-            f.write("\n".join(entries) + "\n")
+    for idx, (orig, corr) in enumerate(zip(original, corrected), start=1):
+        o, c = str(orig).strip(), str(corr).strip()
+        if o == c or not o:
+            continue
+        source = correction_sources[idx - 1] if idx - 1 < len(correction_sources) else ""
+        if not source:
+            source = "AI" if ai_enabled else "RULE"
+        entries.append(
+            f"  行 {idx:03d} [{source}]\n"
+            f"    原始：{o}\n"
+            f"    修正：{c}"
+        )
+    if not entries:
+        return
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(
+            f"\n[{datetime.now().strftime('%H:%M:%S')}] {file_name}"
+            f" 第 {page_num + 1} 頁  [{engine}]\n"
+        )
+        f.write("\n".join(entries) + "\n")
 
 
 # ==============================================================
@@ -951,24 +1185,47 @@ class OCRProcessor:
 
     # ----------------------------------------------------------
     def collect_pdf_files(self) -> list:
-        """Collect PDF file paths from config.input_path."""
+        """Collect source PDFs while excluding generated OCR outputs."""
         input_path = os.path.abspath(os.path.expanduser(self.config.input_path))
-        if os.path.isfile(input_path) and input_path.lower().endswith(".pdf"):
-            return [input_path]
+        output_root = os.path.abspath(os.path.expanduser(self.config.output_path or ""))
+
+        def eligible(path: str) -> bool:
+            lower = os.path.basename(path).lower()
+            if not lower.endswith(".pdf"):
+                return False
+            if self.config.exclude_ocr_output and (
+                lower.endswith("_ocr.pdf")
+                or lower.endswith("_ocr_ocr.pdf")
+                or lower.endswith("_searchable.pdf")
+                or lower.endswith(".part.pdf")
+            ):
+                return False
+            full = os.path.abspath(path)
+            if output_root and os.path.isdir(output_root):
+                try:
+                    if os.path.commonpath([full, output_root]) == output_root:
+                        return False
+                except ValueError:
+                    pass
+            return True
+
+        if os.path.isfile(input_path):
+            return [input_path] if eligible(input_path) else []
         if os.path.isdir(input_path):
+            files = []
             if self.config.recursive:
-                files = []
                 for root, dirs, fnames in os.walk(input_path):
+                    dirs[:] = [d for d in dirs if d.lower() not in {".ocr_state", "output", "outputs"}]
                     for fname in sorted(fnames):
-                        if fname.lower().endswith(".pdf"):
-                            files.append(os.path.join(root, fname))
-                return files
+                        candidate = os.path.join(root, fname)
+                        if eligible(candidate):
+                            files.append(candidate)
             else:
-                return sorted(
-                    os.path.join(input_path, f)
-                    for f in os.listdir(input_path)
-                    if f.lower().endswith(".pdf")
-                )
+                for fname in sorted(os.listdir(input_path)):
+                    candidate = os.path.join(input_path, fname)
+                    if eligible(candidate):
+                        files.append(candidate)
+            return files
         return []
 
     # ----------------------------------------------------------
@@ -1073,6 +1330,8 @@ class OCRProcessor:
 
         target_pdf = os.path.join(out_dir, stem + "_OCR.pdf")
         target_txt = os.path.join(out_dir, stem + "_OCR.txt")
+        raw_txt = os.path.join(out_dir, stem + "_OCR_raw.txt")
+        corrected_txt = os.path.join(out_dir, stem + "_OCR_corrected.txt")
         analysis_txt = os.path.join(out_dir, stem + "_OCR_analysis.txt")
         log_path = os.path.join(
             os.path.abspath(os.path.expanduser(cfg.output_path)), "verify_log.txt"
@@ -1086,11 +1345,11 @@ class OCRProcessor:
 
         # Overwrite: remove existing outputs
         if cfg.overwrite:
-            for path in (target_txt, analysis_txt):
+            for path in (target_txt, raw_txt, corrected_txt, analysis_txt):
                 if os.path.exists(path):
                     os.remove(path)
         else:
-            for path in (target_txt, analysis_txt):
+            for path in (target_txt, raw_txt, corrected_txt, analysis_txt):
                 if os.path.exists(path):
                     os.remove(path)
 
@@ -1108,8 +1367,13 @@ class OCRProcessor:
                 ocr_data = []
                 for p in batch_pages:
                     self._check_cancel_pause()
-                    ln, tx, cf, mode = ocr_page_paddle(p, self._ocr, zoom=cfg.zoom,
-                                                        preprocess_mode=cfg.preprocess_mode)
+                    ln, tx, cf, mode = ocr_page_paddle(
+                        p, self._ocr, zoom=cfg.zoom, preprocess_mode=cfg.preprocess_mode,
+                        max_page_pixels=cfg.max_page_pixels,
+                        memory_retry_enabled=cfg.memory_retry_enabled,
+                        memory_retry_scales=cfg.memory_retry_scales,
+                        release_between_candidates=cfg.release_between_candidates,
+                    )
                     ocr_data.append([ln, tx, cf, cfg.zoom, mode])
 
                 sample = " ".join(" ".join(d[1]) for d in ocr_data)
@@ -1144,7 +1408,7 @@ class OCRProcessor:
                 else:
                     self._report_file_status(file_index, pdf_path, "Claude 校對中")
                     prompt, timeout = engine_prompt(engine, content_mode)
-                    preprocessed = [apply_hard_corrections(tx) for tx in engine_texts]
+                    preprocessed = [apply_safe_corrections(tx, file_name)[0] for tx in engine_texts]
                     t0 = time.perf_counter()
                     corrected_pages, uncertain = call_claude_batch(
                         preprocessed, prompt, timeout, claude_model=self._claude_model
@@ -1161,7 +1425,11 @@ class OCRProcessor:
                     if uncertain:
                         lines, raw_texts, confs, preprocess_mode = ocr_page_paddle(
                             page_obj, self._ocr, zoom=cfg.zoom + 1,
-                            preprocess_mode=cfg.preprocess_mode
+                            preprocess_mode=cfg.preprocess_mode,
+                            max_page_pixels=cfg.max_page_pixels,
+                            memory_retry_enabled=cfg.memory_retry_enabled,
+                            memory_retry_scales=cfg.memory_retry_scales,
+                            release_between_candidates=cfg.release_between_candidates,
                         )
                         ocr_data[j] = [lines, raw_texts, confs, cfg.zoom + 1, preprocess_mode]
                         zoom = cfg.zoom + 1
@@ -1181,16 +1449,22 @@ class OCRProcessor:
                                 f"[警告] 對齊後行數仍不符，回退至規則校正結果。"
                             )
                             corrected = engine_texts[j]
-                    corrected = apply_hard_corrections(corrected)
+                    rule_corrected, rule_sources = apply_safe_corrections(corrected, file_name)
+                    final_texts = rule_corrected
+                    sources = [src or ("AI" if a.strip() != b.strip() else "")
+                               for src, a, b in zip(rule_sources, raw_texts, final_texts)]
 
                     if cfg.output_pdf:
-                        apply_text_overlay(page_obj, lines, corrected, zoom)
+                        apply_text_overlay(page_obj, lines, final_texts, zoom)
                     if cfg.output_txt:
-                        append_ocr_text(target_txt, page_idx, corrected)
+                        append_ocr_text(target_txt, page_idx, final_texts)
+                        append_ocr_text(corrected_txt, page_idx, final_texts)
+                    if cfg.output_raw_txt:
+                        append_ocr_text(raw_txt, page_idx, raw_texts)
                     if cfg.output_analysis:
-                        append_quality_analysis(analysis_txt, file_name, page_idx, raw_texts, confs, preprocess_mode, corrected)
+                        append_quality_analysis(analysis_txt, file_name, page_idx, raw_texts, confs, preprocess_mode, final_texts, sources)
                     if cfg.output_verify_log:
-                        log_corrections(log_path, file_name, page_idx, raw_texts, corrected, disp_engine, ai_enabled=True)
+                        log_corrections(log_path, file_name, page_idx, raw_texts, final_texts, disp_engine, ai_enabled=True, correction_sources=sources)
 
                     page_time = elapsed / max(len(batch_pages), 1)
                     page_times.append(page_time)
@@ -1213,18 +1487,25 @@ class OCRProcessor:
                 self._check_cancel_pause()
                 t0 = time.perf_counter()
                 lines, raw_texts, confidences, preprocess_mode = ocr_page_paddle(
-                    page_obj, self._ocr, zoom=cfg.zoom, preprocess_mode=cfg.preprocess_mode
+                    page_obj, self._ocr, zoom=cfg.zoom, preprocess_mode=cfg.preprocess_mode,
+                    max_page_pixels=cfg.max_page_pixels,
+                    memory_retry_enabled=cfg.memory_retry_enabled,
+                    memory_retry_scales=cfg.memory_retry_scales,
+                    release_between_candidates=cfg.release_between_candidates,
                 )
-                fixed = apply_hard_corrections(raw_texts)
+                fixed, sources = apply_safe_corrections(raw_texts, file_name)
 
                 if cfg.output_pdf:
                     apply_text_overlay(page_obj, lines, fixed, cfg.zoom)
                 if cfg.output_txt:
                     append_ocr_text(target_txt, page_num, fixed)
+                    append_ocr_text(corrected_txt, page_num, fixed)
+                if cfg.output_raw_txt:
+                    append_ocr_text(raw_txt, page_num, raw_texts)
                 if cfg.output_analysis:
-                    append_quality_analysis(analysis_txt, file_name, page_num, raw_texts, confidences, preprocess_mode, fixed)
+                    append_quality_analysis(analysis_txt, file_name, page_num, raw_texts, confidences, preprocess_mode, fixed, sources)
                 if cfg.output_verify_log:
-                    log_corrections(log_path, file_name, page_num, raw_texts, fixed, "PADDLE", ai_enabled=False)
+                    log_corrections(log_path, file_name, page_num, raw_texts, fixed, "PADDLE", ai_enabled=False, correction_sources=sources)
 
                 elapsed = time.perf_counter() - t0
                 page_times.append(elapsed)
@@ -1259,6 +1540,9 @@ class OCRProcessor:
         self._log(f"  [V] PDF 完成: {target_pdf}")
         if cfg.output_txt:
             self._log(f"  [V] TXT 完成: {target_txt}")
+            self._log(f"  [V] 校正版 TXT: {corrected_txt}")
+        if cfg.output_raw_txt:
+            self._log(f"  [V] 原始 TXT: {raw_txt}")
         if cfg.output_analysis:
             self._log(f"  [V] 分析完成: {analysis_txt}")
         self._log(f"      平均速度: {avg_total:.2f}s/頁")

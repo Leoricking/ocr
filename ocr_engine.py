@@ -212,8 +212,13 @@ def _run_argparse(args):
         "--preprocess", choices=["auto", "original", "clahe", "binary"], default="auto",
         help="預處理模式（預設 auto）",
     )
-    parser.add_argument("--no-pdf", action="store_true", help="不輸出 PDF")
-    parser.add_argument("--no-txt", action="store_true", help="不輸出 TXT")
+    parser.add_argument(
+        "--output-mode", choices=["all", "pdf", "txt"], default=None,
+        help="主要輸出模式：all=PDF+TXT、pdf=只輸出 PDF、txt=只輸出 TXT",
+    )
+    # Legacy switches are retained for backward compatibility.
+    parser.add_argument("--no-pdf", action="store_true", help="不輸出 PDF（舊版相容）")
+    parser.add_argument("--no-txt", action="store_true", help="不輸出 TXT（舊版相容）")
     parser.add_argument("--no-analysis", action="store_true", help="不輸出品質分析")
     parser.add_argument("--no-verify-log", action="store_true", help="不輸出校正日誌")
     parser.add_argument("--flat-output", action="store_true",
@@ -232,6 +237,19 @@ def _run_argparse(args):
 
     # Resolve skip_existing: default True unless --overwrite is set
     skip_existing = parsed.skip_existing or (not parsed.overwrite)
+
+    # Resolve primary output mode.  New --output-mode takes precedence while
+    # legacy --no-pdf/--no-txt remain supported.
+    if parsed.output_mode == "all":
+        output_pdf, output_txt = True, True
+    elif parsed.output_mode == "pdf":
+        output_pdf, output_txt = True, False
+    elif parsed.output_mode == "txt":
+        output_pdf, output_txt = False, True
+    else:
+        output_pdf, output_txt = (not parsed.no_pdf), (not parsed.no_txt)
+    if not output_pdf and not output_txt:
+        parser.error("PDF 與 TXT 不可同時停用；請使用 --output-mode all、pdf 或 txt")
 
     # Handle multiple input paths
     input_paths = [os.path.abspath(os.path.expanduser(p)) for p in parsed.input]
@@ -255,8 +273,8 @@ def _run_argparse(args):
             skip_existing=skip_existing and not parsed.overwrite,
             zoom=parsed.zoom,
             preprocess_mode=parsed.preprocess,
-            output_pdf=not parsed.no_pdf,
-            output_txt=not parsed.no_txt,
+            output_pdf=output_pdf,
+            output_txt=output_txt,
             output_analysis=not parsed.no_analysis,
             output_verify_log=not parsed.no_verify_log,
             preserve_relative_structure=not parsed.flat_output,
