@@ -208,7 +208,8 @@ def create_proofreader(config: dict) -> Proofreader:
     elif engine in ("openai",):
         return OpenAIProofreader(model=model or "gpt-4o-mini", level=level)
     elif engine in ("claude", "anthropic"):
-        return ClaudeProofreader(model=model, level=level)
+        log.warning("Claude proofreading is disabled; using offline rule proofreading")
+        return RuleProofreader()
     elif engine in ("gemini",):
         return GeminiProofreader(model=model or "gemini-1.5-flash", level=level)
     elif engine in ("openai_compatible", "compatible"):

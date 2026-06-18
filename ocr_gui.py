@@ -1,5 +1,5 @@
-# ocr_gui.py — Full tkinter GUI for OCR Engine v4.5.5
-# Window title: OCR Engine v4.5.5 — PDF 搜尋化與品質分析系統
+# ocr_gui.py — Full tkinter GUI for OCR Engine v4.5.8
+# Window title: OCR Engine v4.5.8 — PDF 搜尋化與離線文字校正系統
 
 import os
 import sys
@@ -74,8 +74,8 @@ def _ensure_ocr_core():
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION = "v4.5.5"
-TITLE = f"OCR Engine {VERSION} — PDF 搜尋化與品質分析系統"
+VERSION = "v4.5.8"
+TITLE = f"OCR Engine {VERSION} — PDF 搜尋化與離線文字校正系統"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(PROJECT_DIR, "logs")
 
@@ -495,35 +495,19 @@ class OCRGuiApp:
             row=2, column=0, sticky="w", pady=3
         )
 
-        # ---- 2. Claude 校對 ----
-        claude_frm = ttk.LabelFrame(parent, text="Claude 校對", padding=8)
-        claude_frm.grid(row=row, column=0, sticky="ew", padx=4, pady=6)
-        claude_frm.columnconfigure(1, weight=1)
+        # ---- 2. 離線文字校正 ----
+        correction_frm = ttk.LabelFrame(parent, text="離線文字校正", padding=8)
+        correction_frm.grid(row=row, column=0, sticky="ew", padx=4, pady=6)
+        correction_frm.columnconfigure(0, weight=1)
         row += 1
-
-        cr = 0
-        self._var_claude = tk.BooleanVar()
-        ttk.Checkbutton(claude_frm, text="啟用 Claude 校對", variable=self._var_claude).grid(
-            row=cr, column=0, columnspan=2, sticky="w", pady=3
-        )
-        cr += 1
-
+        self._var_claude = tk.BooleanVar(value=False)  # legacy compatibility only
+        self._var_claude_model = tk.StringVar(value="")
         self._lbl_api_status = ttk.Label(
-            claude_frm, text="API Key：未設定", foreground="#B71C1C",
-            wraplength=220, justify=tk.LEFT, anchor="w"
+            correction_frm,
+            text="已啟用本機金融／科學詞庫與上下文校正\n不使用 Claude API，也不需要 API Key",
+            foreground="#1B5E20", wraplength=230, justify=tk.LEFT, anchor="w"
         )
-        self._lbl_api_status.grid(row=cr, column=0, columnspan=2, sticky="w", pady=3)
-        self._update_api_key_label()
-        cr += 1
-
-        ttk.Label(claude_frm, text="Claude 模型：").grid(row=cr, column=0, sticky="w", pady=3)
-        self._var_claude_model = tk.StringVar()
-        ttk.Entry(claude_frm, textvariable=self._var_claude_model, width=22).grid(row=cr, column=1, sticky="ew", pady=3)
-        cr += 1
-
-        ttk.Button(claude_frm, text="測試 Claude API", command=self._test_claude_api).grid(
-            row=cr, column=0, columnspan=2, sticky="w", pady=3
-        )
+        self._lbl_api_status.grid(row=0, column=0, sticky="w", pady=3)
 
         # ---- 3. OCR 設定 ----
         ocr_frm = ttk.LabelFrame(parent, text="OCR 設定", padding=8)
@@ -815,8 +799,8 @@ class OCRGuiApp:
         self._var_output.set(s.get("last_output_path", ""))
         self._var_recursive.set(s.get("recursive", False))
         self._var_device.set(s.get("device", "gpu"))
-        self._var_claude.set(s.get("enable_claude", False))
-        self._var_claude_model.set(s.get("claude_model", ""))
+        self._var_claude.set(False)
+        self._var_claude_model.set("")
         self._var_zoom.set(str(s.get("zoom", 3)))
         preprocess_val = s.get("preprocess_mode", "auto")
         self._var_preprocess.set(PREPROCESS_LABELS_REV.get(preprocess_val, "自動選最佳"))
@@ -862,8 +846,8 @@ class OCRGuiApp:
         s["last_output_path"] = self._var_output.get()
         s["recursive"] = self._var_recursive.get()
         s["device"] = self._var_device.get()
-        s["enable_claude"] = self._var_claude.get()
-        s["claude_model"] = self._var_claude_model.get()
+        s["enable_claude"] = False
+        s["claude_model"] = ""
         s["zoom"] = int(self._var_zoom.get())
         s["preprocess_mode"] = PREPROCESS_LABELS.get(self._var_preprocess.get(), "auto")
         output_mode = self._var_output_mode.get()
@@ -1310,19 +1294,8 @@ class OCRGuiApp:
         threading.Thread(target=_run, daemon=True).start()
 
     def _test_claude_api(self):
-        self._append_log("[API] 正在測試 Claude API Key...")
+        self._append_log("[離線校正] Claude API 已停用；不需要 API Key。")
 
-        def _run():
-            try:
-                from ocr_core import validate_key
-                model = self._var_claude_model.get().strip()
-                ok = validate_key(model)
-                self._task_queue.put(("claude_test_result", ok))
-            except Exception as exc:
-                self._task_queue.put(("claude_test_result", False))
-                self._task_queue.put(("log", f"[API] 測試失敗：{exc}"))
-
-        threading.Thread(target=_run, daemon=True).start()
 
     # -----------------------------------------------------------------------
     # Timer (Part B3)
@@ -1494,7 +1467,7 @@ class OCRGuiApp:
             "input_path":  s.get("last_input_path", ""),
             "output_path": s.get("last_output_path", ""),
             "device":      device,
-            "enable_claude": s.get("enable_claude", False),
+            "enable_claude": False,
             "recursive":   s.get("recursive", False),
             "overwrite":   s.get("overwrite", False),
             "skip_existing": s.get("skip_existing", True) and not s.get("overwrite", False),

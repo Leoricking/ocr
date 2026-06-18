@@ -29,9 +29,6 @@ from ocr_core import (
     OCRProgress,
     OCRCancelledError,
     print_environment_summary,
-    validate_key,
-    CLAUDE_API_KEY,
-    CLAUDE_MODEL_DEFAULT,
     gpu_runtime_self_test,
     _find_dll,
     PaddleOCR,
@@ -40,7 +37,7 @@ from ocr_core import (
 from tqdm import tqdm
 
 
-VERSION = "v4.4.0"
+VERSION = "v4.5.8"
 HEADER = f"=== 數千本圖書 PDF 搜尋化系統 ({VERSION} PDF+TXT 品質分析版) ==="
 
 
@@ -108,8 +105,8 @@ def _run_interactive():
     output_root = input("請輸入【輸出路徑】: ").strip().replace('"', '')
     gpu_choice = input("1: GPU[RTX 3060], 2: CPU: ").strip()
     use_gpu = gpu_choice == '1'
-    ai_choice = input("是否啟用 Claude 自動校對？ (y/n): ").strip().lower()
-    enable_claude = ai_choice == 'y'
+    print("[離線校正] 本版本不使用 Claude API，將自動套用本機詞庫與上下文校正。")
+    enable_claude = False
 
     input_path = os.path.abspath(os.path.expanduser(input_path))
     output_root = os.path.abspath(os.path.expanduser(output_root))
@@ -142,12 +139,6 @@ def _run_interactive():
                     print(gpu_detail[-2000:])
                 use_gpu = False
 
-    if enable_claude:
-        if not CLAUDE_API_KEY or CLAUDE_API_KEY == "YOUR_CLAUDE_API_KEY":
-            print("\n[API] 尚未設定 CLAUDE_API_KEY，已取消 AI 校對。")
-            enable_claude = False
-        elif not validate_key():
-            return
 
     print(f"\n[執行裝置] {'GPU' if use_gpu else 'CPU'}")
 
@@ -198,7 +189,7 @@ def _run_argparse(args):
     parser.add_argument("--input", "-i", metavar="PATH", nargs="+", help="來源 PDF 或資料夾（可多個）")
     parser.add_argument("--output", "-o", metavar="PATH", help="輸出資料夾")
     parser.add_argument("--device", choices=["gpu", "cpu"], default="gpu", help="運算裝置（預設 gpu）")
-    parser.add_argument("--claude", choices=["on", "off"], default="off", help="Claude 自動校對（預設 off）")
+    parser.add_argument("--claude", choices=["on", "off"], default="off", help="已棄用；永遠使用離線校正")
     parser.add_argument("--recursive", action="store_true", help="遞迴處理子資料夾")
 
     # Mutually exclusive overwrite / skip-existing
@@ -267,7 +258,7 @@ def _run_argparse(args):
             input_path=input_path,
             output_path=output_path,
             device=parsed.device,
-            enable_claude=(parsed.claude == "on"),
+            enable_claude=False,
             recursive=parsed.recursive,
             overwrite=parsed.overwrite,
             skip_existing=skip_existing and not parsed.overwrite,

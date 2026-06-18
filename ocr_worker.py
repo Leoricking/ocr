@@ -203,6 +203,9 @@ def process_pdf_with_checkpoint(
 
     try:
         if config.enable_claude:
+            emit_log("[離線校正] 已忽略 enable_claude；不使用 Claude API。")
+            config.enable_claude = False
+        if config.enable_claude:
             for batch_start in range(0, total_pages, BATCH_SIZE):
                 _check_control(control_file, OCRCancelledError)
                 batch_indices = range(batch_start, min(batch_start + BATCH_SIZE, total_pages))

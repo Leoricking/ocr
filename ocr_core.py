@@ -1,4 +1,4 @@
-# ocr_core.py — Shared OCR core for OCR Engine v4.5.2
+# ocr_core.py — Shared OCR core for OCR Engine v4.5.7
 # All OCR logic, constants, helpers, and the OCRProcessor class live here.
 # This module must be imported BEFORE PaddleOCR is imported anywhere else,
 # because the GPU DLL search-path setup must happen first.
@@ -15,6 +15,10 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Optional, List, Tuple, Dict
+from offline_corrector import correct_lines
+from layout_analyzer import PageLayoutAnalyzer
+from ocr_quality import BlockTextEvaluator, FINANCE_TERMS
+from collections import Counter
 
 # ==============================================================
 # Windows GPU DLL search-path setup
@@ -84,7 +88,10 @@ GPU_DLL_PATHS = configure_windows_gpu_dll_paths()
 from tqdm import tqdm
 import fitz  # PyMuPDF
 from paddleocr import PaddleOCR
-import anthropic
+try:
+    import anthropic  # optional legacy dependency
+except Exception:
+    anthropic = None
 import cv2
 import numpy as np
 
@@ -115,12 +122,15 @@ class OCRConfig:
     input_path: str = ""
     output_path: str = ""
     device: str = "gpu"                     # "gpu" or "cpu"
-    enable_claude: bool = False
+    enable_claude: bool = False  # deprecated; offline correction is always used
     recursive: bool = False
     overwrite: bool = False
     skip_existing: bool = True
     zoom: int = 3
     preprocess_mode: str = "auto"           # "auto" | "original" | "clahe" | "binary"
+    layout_aware: bool = True
+    region_retry_threshold: float = 65.0
+    filter_chart_noise: bool = True
     output_pdf: bool = True
     output_txt: bool = True
     output_analysis: bool = True
@@ -129,7 +139,7 @@ class OCRConfig:
     exclude_ocr_output: bool = True
     confidence_threshold: float = 0.70
     preserve_relative_structure: bool = True
-    claude_model: str = ""                  # empty → use CLAUDE_MODEL env var
+    claude_model: str = ""                  # deprecated legacy field
     batch_failure_continue: bool = True
     max_page_pixels: int = 24_000_000
     memory_retry_enabled: bool = True
@@ -170,31 +180,12 @@ _client_cache = {}
 
 
 def get_anthropic_client(model: str = ""):
-    """Lazily create a Claude API client, optionally with a custom model string (unused in client but kept for consistency)."""
-    global _client_cache
-    key = CLAUDE_API_KEY
-    if key not in _client_cache:
-        _client_cache[key] = anthropic.Anthropic(api_key=key)
-    return _client_cache[key]
+    raise RuntimeError("Claude API support is disabled; offline correction is always used.")
 
 
 def validate_key(model: str = "") -> bool:
-    """Validate the Claude API key with a minimal call."""
-    use_model = model if model else CLAUDE_MODEL_DEFAULT
-    try:
-        get_anthropic_client().messages.create(
-            model=use_model,
-            max_tokens=1,
-            messages=[{"role": "user", "content": "hi"}],
-        )
-        print("[API] 金鑰驗證成功")
-        return True
-    except anthropic.AuthenticationError:
-        print("[API] ❌ 金鑰無效，請檢查 CLAUDE_API_KEY 設定（AuthenticationError）")
-        return False
-    except Exception as e:
-        print(f"[API] ⚠ 驗證時發生非認證錯誤 ({type(e).__name__})，繼續執行")
-        return True
+    print("[離線校正] Claude API 已停用；不需要 API Key。")
+    return False
 
 
 # ==============================================================
@@ -496,14 +487,19 @@ def _build_preprocess_candidate(image_bgr, mode: str):
     mode = mode.upper()
     if mode == "ORIGINAL":
         return image_bgr
+    if mode == "UPSCALE":
+        return cv2.resize(image_bgr, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     try:
         denoised = cv2.fastNlMeansDenoising(
             gray, None, h=7, templateWindowSize=7, searchWindowSize=21
         )
-        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+        clip_limit = 1.45 if mode == "LIGHT_CLAHE" else 2.2
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
         contrast = clahe.apply(denoised)
+        if mode == "LIGHT_CLAHE":
+            return contrast
         blur = cv2.GaussianBlur(contrast, (0, 0), 1.0)
         sharpened = cv2.addWeighted(contrast, 1.45, blur, -0.45, 0)
         if mode == "CLAHE":
@@ -628,22 +624,222 @@ def _candidate_score(texts, confidences):
 # ==============================================================
 # OCR page functions
 # ==============================================================
+def _offset_ocr_lines(lines, offset_x: float, offset_y: float, scale_back: float = 1.0):
+    adjusted = []
+    for line in lines or []:
+        box, payload = line[0], line[1]
+        new_box = [
+            [
+                (float(point[0]) + offset_x) * scale_back,
+                (float(point[1]) + offset_y) * scale_back,
+            ]
+            for point in box
+        ]
+        adjusted.append([new_box, payload])
+    return adjusted
+
+
+def _chart_line_is_useful(text: str) -> bool:
+    """Keep chart captions/labels while dropping coordinate and status-bar noise."""
+    stripped = str(text).strip()
+    if not stripped:
+        return False
+    upper = stripped.upper()
+    if "圖" in stripped and any(ch.isalpha() or "\u4e00" <= ch <= "\u9fff" for ch in stripped):
+        return True
+    if any(key in upper for key in ("MACD", "DIFF", "DEA", "KDJ", "RSI", "BOLL")):
+        return len(stripped) <= 36
+    if re.fullmatch(r"(?:13|34|55|89|233)?MA", upper):
+        return True
+    if any(term in stripped for term in ("日線", "週線", "月線", "K線", "成交量", "均量線", "黃金交叉", "死亡交叉")):
+        return True
+    return False
+
+
+def _document_vocabulary_from_lines(texts, confidences):
+    vocab = Counter()
+    joined = "\n".join(texts or [])
+    for term in FINANCE_TERMS:
+        count = joined.count(term)
+        if count:
+            vocab[term] += count
+    for text, conf in zip(texts or [], confidences or []):
+        if conf >= 0.92 and 2 <= len(text.strip()) <= 12:
+            vocab[text.strip()] += 1
+    return vocab
+
+
+def _ocr_candidate_for_crop(ocr, crop, mode, evaluator, document_vocabulary):
+    candidate = encoded = raw_result = None
+    try:
+        candidate = _build_preprocess_candidate(crop, mode)
+        scale_back = 1.0
+        if mode == "UPSCALE":
+            scale_back = 1.0 / 1.5
+        ok, encoded = cv2.imencode(".png", candidate)
+        if not ok:
+            return None
+        raw_result = ocr.ocr(encoded.tobytes(), cls=True)
+        width = candidate.shape[1]
+        lines, texts, confidences = _normalize_ocr_result(raw_result, width)
+        if scale_back != 1.0:
+            lines = _scale_ocr_lines(lines, scale_back)
+        quality = evaluator.score(texts, confidences, document_vocabulary)
+        return {
+            "mode": mode,
+            "score": quality.total,
+            "quality": quality,
+            "lines": lines,
+            "texts": texts,
+            "confidences": confidences,
+        }
+    finally:
+        raw_result = None
+        encoded = None
+        candidate = None
+
+
+def _ocr_page_layout_aware(
+    image, ocr, evaluator, requested_zoom, effective_zoom,
+    retry_threshold=65.0, filter_chart_noise=True,
+):
+    """Seed full-page OCR, segment geometry, then rerun only text regions."""
+    encoded = None
+    try:
+        ok, encoded = cv2.imencode(".png", image)
+        if not ok:
+            return None
+        seed_result = ocr.ocr(encoded.tobytes(), cls=True)
+    finally:
+        encoded = None
+
+    page_width = image.shape[1]
+    page_height = image.shape[0]
+    seed_lines, seed_texts, seed_confidences = _normalize_ocr_result(seed_result, page_width)
+    if not seed_lines:
+        return None
+
+    analyzer = PageLayoutAnalyzer()
+    regions = analyzer.analyze(seed_lines, page_width, page_height)
+    if not regions:
+        return None
+    document_vocabulary = _document_vocabulary_from_lines(seed_texts, seed_confidences)
+
+    output_lines = []
+    output_modes = []
+    output_scores = []
+    for region in regions:
+        if region.region_type == "noise":
+            continue
+        if region.region_type == "chart" and filter_chart_noise:
+            useful = [line for line in region.lines if _chart_line_is_useful(str(line[1][0]))]
+            output_lines.extend(useful)
+            if useful:
+                output_modes.append("CHART_FILTER")
+                output_scores.append(75.0)
+            continue
+
+        x0, y0, x1, y1 = analyzer.padded_bbox(region, page_width, page_height, pad=10)
+        if x1 <= x0 or y1 <= y0:
+            output_lines.extend(region.lines)
+            continue
+        crop = image[y0:y1, x0:x1]
+        if crop.size == 0:
+            output_lines.extend(region.lines)
+            continue
+
+        modes = ["ORIGINAL", "LIGHT_CLAHE"]
+        if region.region_type in {"title", "caption"}:
+            modes.append("UPSCALE")
+        candidates = []
+        for mode in modes:
+            try:
+                item = _ocr_candidate_for_crop(ocr, crop, mode, evaluator, document_vocabulary)
+                if item:
+                    candidates.append(item)
+            except Exception as exc:
+                if not _is_memory_error(exc):
+                    print(f"  [區塊 OCR] {mode} 失敗：{exc}")
+            finally:
+                _release_memory(use_gpu=False)
+
+        if candidates:
+            best = max(candidates, key=lambda item: item["score"])
+        else:
+            best = None
+
+        if best is None or best["score"] < retry_threshold:
+            for mode in ("CLAHE", "BINARY", "UPSCALE"):
+                if any(item["mode"] == mode for item in candidates):
+                    continue
+                try:
+                    item = _ocr_candidate_for_crop(ocr, crop, mode, evaluator, document_vocabulary)
+                    if item:
+                        candidates.append(item)
+                        if best is None or item["score"] > best["score"]:
+                            best = item
+                except Exception as exc:
+                    if not _is_memory_error(exc):
+                        print(f"  [區塊重跑] {mode} 失敗：{exc}")
+                finally:
+                    _release_memory(use_gpu=False)
+
+        if best is None or not best["lines"]:
+            output_lines.extend(region.lines)
+            output_modes.append("SEED_FALLBACK")
+            output_scores.append(0.0)
+            continue
+
+        output_lines.extend(_offset_ocr_lines(best["lines"], x0, y0, 1.0))
+        output_modes.append(best["mode"])
+        output_scores.append(best["score"])
+
+    if not output_lines:
+        return None
+
+    ordered = _sort_reading_order(output_lines, page_width)
+    texts = [str(line[1][0]).strip() for line in ordered]
+    confidences = [float(line[1][1]) for line in ordered]
+    scale = requested_zoom / effective_zoom
+    scaled_lines = _scale_ocr_lines(ordered, scale)
+    avg_score = sum(output_scores) / len(output_scores) if output_scores else 0.0
+    unique_modes = sorted(set(output_modes))
+    if unique_modes and all(mode == "SEED_FALLBACK" for mode in unique_modes):
+        mode_summary = "ORIGINAL"
+    else:
+        mode_summary = "LAYOUT:" + "+".join(unique_modes or ["ORIGINAL"])
+    print(
+        f"  [版面分區] 區塊 {len(regions)}，輸出 {len(ordered)} 行，"
+        f"區塊品質 {avg_score:.1f}/100，模式 {mode_summary}"
+    )
+    return scaled_lines, texts, confidences, mode_summary
+
+
 def ocr_page_paddle(
     page, ocr, zoom: int = 3, preprocess_mode: str = "auto",
     max_page_pixels: int = 24_000_000,
     memory_retry_enabled: bool = True,
     memory_retry_scales=None,
     release_between_candidates: bool = True,
+    layout_aware: bool | None = None,
+    region_retry_threshold: float = 65.0,
+    filter_chart_noise: bool = True,
 ):
-    """Run PaddleOCR with sequential candidates and memory-safe zoom fallback.
+    """Run PaddleOCR with layout segmentation and low-quality region reruns.
 
-    The returned line coordinates are scaled back to the originally requested zoom,
-    so existing overlay code remains compatible.
+    The layout path is enabled by default in auto mode.  It performs a seed
+    full-page OCR, groups lines into title/body/chart regions, reruns only text
+    regions using competing preprocessing modes, and filters chart-coordinate
+    noise from TXT output.  Any failure falls back to the established full-page
+    sequential candidate path.
     """
     requested_zoom = float(zoom)
     retry_scales = list(memory_retry_scales or [1.0, 0.8, 0.65, 0.5])
     if not memory_retry_enabled:
         retry_scales = [1.0]
+
+    if layout_aware is None:
+        layout_aware = os.environ.get("OCR_LAYOUT_AWARE", "1").strip().lower() not in {"0", "false", "no"}
 
     base_zoom = _effective_zoom_for_page(page, requested_zoom, int(max_page_pixels or 0))
     attempts = []
@@ -663,19 +859,35 @@ def ocr_page_paddle(
     modes = [mode_map.get(preprocess_mode.lower(), "ORIGINAL")] if preprocess_mode != "auto" else [
         "ORIGINAL", "CLAHE", "BINARY"
     ]
+    evaluator = BlockTextEvaluator()
 
     for attempt_index, effective_zoom in enumerate(attempts, start=1):
         image = None
         try:
             image = _page_to_bgr(page, effective_zoom)
             page_width = image.shape[1]
+
+            if layout_aware and preprocess_mode == "auto":
+                try:
+                    layout_result = _ocr_page_layout_aware(
+                        image, ocr, evaluator, requested_zoom, effective_zoom,
+                        retry_threshold=float(region_retry_threshold),
+                        filter_chart_noise=bool(filter_chart_noise),
+                    )
+                    if layout_result is not None:
+                        return layout_result
+                except Exception as exc:
+                    if _is_memory_error(exc):
+                        last_memory_error = exc
+                        print(f"  [版面分區] 記憶體不足，回退整頁模式：{exc}")
+                    else:
+                        print(f"  [版面分區] 分區失敗，回退整頁模式：{exc}")
+                    _release_memory(use_gpu=True)
+
             best = None
             memory_failures = 0
-
             for mode in modes:
-                candidate = None
-                encoded = None
-                raw_result = None
+                candidate = encoded = raw_result = None
                 try:
                     candidate = _build_preprocess_candidate(image, mode)
                     ok, encoded = cv2.imencode(".png", candidate)
@@ -683,15 +895,15 @@ def ocr_page_paddle(
                         continue
                     raw_result = ocr.ocr(encoded.tobytes(), cls=True)
                     lines, texts, confidences = _normalize_ocr_result(raw_result, page_width)
-                    score = _candidate_score(texts, confidences)
+                    quality = evaluator.score(texts, confidences)
                     compact = {
                         "mode": mode,
-                        "score": score,
+                        "score": quality.total,
                         "lines": lines,
                         "texts": texts,
                         "confidences": confidences,
                     }
-                    if best is None or score > best["score"]:
+                    if best is None or compact["score"] > best["score"]:
                         best = compact
                 except Exception as exc:
                     if _is_memory_error(exc):
@@ -709,14 +921,11 @@ def ocr_page_paddle(
                         _release_memory(use_gpu=False)
 
             if best is not None:
-                # Existing overlay divides coordinates by requested zoom. Scale boxes
-                # accordingly when a lower effective zoom was used.
                 scale = requested_zoom / effective_zoom
                 lines = _scale_ocr_lines(best["lines"], scale)
                 if effective_zoom < requested_zoom:
                     print(
-                        f"  [記憶體保護] Zoom {effective_zoom:.2f} 成功，"
-                        f"採用 {best['mode']} 結果"
+                        f"  [記憶體保護] Zoom {effective_zoom:.2f} 成功，採用 {best['mode']} 結果"
                     )
                 return lines, best["texts"], best["confidences"], best["mode"]
 
@@ -806,37 +1015,13 @@ def _formula_dense(text: str) -> bool:
 
 
 def apply_safe_corrections(texts: list, file_name: str = "") -> Tuple[list, list]:
-    """Apply conservative corrections and return (texts, sources).
+    """Apply offline domain/document-aware corrections.
 
-    sources contains an empty string for unchanged lines, otherwise a short
-    rule identifier.  Formula-dense lines are left untouched unless the whole
-    line is an exact verified match.
+    This function never performs network requests and preserves one output line
+    for every input line so PDF overlay and checkpoint alignment remain stable.
     """
-    doc_key = _document_key(file_name)
-    doc_rules = DOCUMENT_SPECIFIC_CORRECTIONS.get(doc_key, {})
-    page_context = " ".join(str(t) for t in texts)
-    result, sources = [], []
-    for original in texts:
-        text = str(original)
-        source = ""
-        if text in doc_rules:
-            text = doc_rules[text]
-            source = f"document:{doc_key}"
-        elif text in EXACT_LINE_CORRECTIONS:
-            text = EXACT_LINE_CORRECTIONS[text]
-            source = "exact-line"
-        elif not _formula_dense(text):
-            for wrong, right in EXACT_PHRASE_CORRECTIONS.items():
-                if wrong in text:
-                    text = text.replace(wrong, right)
-                    source = "exact-phrase"
-            for required, wrong, right in CONTEXT_CORRECTIONS:
-                if wrong in text and all(token in page_context for token in required):
-                    text = text.replace(wrong, right)
-                    source = "context"
-        result.append(text)
-        sources.append(source)
-    return result, sources
+    result = correct_lines([str(t) for t in texts], file_name=file_name)
+    return result.corrected_texts, result.sources
 
 
 def apply_hard_corrections(texts: list, file_name: str = "") -> list:
@@ -873,44 +1058,7 @@ def align_lines(original: list, corrected: list) -> list:
 
 
 def call_claude_batch(batch_texts: list, prompt: str, timeout: float, claude_model: str = ""):
-    use_model = claude_model if claude_model else CLAUDE_MODEL_DEFAULT
-    parts = [PAGE_SEP.format(n=i + 1) + "\n" + "\n".join(texts) for i, texts in enumerate(batch_texts)]
-    combined = "\n\n".join(parts)
-    try:
-        response = get_anthropic_client().messages.create(
-            model=use_model,
-            max_tokens=8192,
-            system=prompt,
-            messages=[{"role": "user", "content": (
-                f"以下是 {len(batch_texts)} 頁的 OCR 文字，每頁以 ===PAGE_N=== 分隔。"
-                "請依序校對每頁，回傳時必須維持 ===PAGE_N=== 分隔格式，不得省略。\n\n" + combined
-            )}],
-            timeout=timeout,
-        )
-        raw = response.content[0].text
-        uncertain = raw.lstrip().startswith("[UNCERTAIN]")
-        if uncertain:
-            raw = raw.lstrip()[len("[UNCERTAIN]"):].lstrip("\n")
-        result_pages = []
-        for i in range(len(batch_texts)):
-            sep = PAGE_SEP.format(n=i + 1)
-            next_sep = PAGE_SEP.format(n=i + 2)
-            start = raw.find(sep)
-            if start == -1:
-                result_pages.append(None)
-                continue
-            start += len(sep)
-            end = raw.find(next_sep, start) if (i + 1 < len(batch_texts)) else len(raw)
-            result_pages.append(raw[start:end].strip().split("\n"))
-        return result_pages, uncertain
-    except anthropic.AuthenticationError:
-        print("\n  [!] 請檢查 API KEY 設定（AuthenticationError），本批次標記為 [Raw OCR]")
-    except anthropic.APITimeoutError:
-        print("\n  [!] Claude API 逾時，保留原始 OCR 文字")
-    except anthropic.APIConnectionError:
-        print("\n  [!] Claude API 連線失敗，保留原始 OCR 文字")
-    except Exception as e:
-        print(f"\n  [!] Claude API 錯誤 ({type(e).__name__})，保留原始 OCR 文字")
+    """Deprecated compatibility shim; external Claude API is disabled."""
     return [None] * len(batch_texts), False
 
 
@@ -1295,6 +1443,9 @@ class OCRProcessor:
         os.makedirs(os.path.abspath(os.path.expanduser(cfg.output_path)), exist_ok=True)
 
         if cfg.enable_claude:
+            self._log("[離線校正] 已忽略 enable_claude；本版本不使用外部 API。")
+            cfg.enable_claude = False
+        if cfg.enable_claude:
             api_key = CLAUDE_API_KEY
             if not api_key or api_key == "YOUR_CLAUDE_API_KEY":
                 self._log("[API] 尚未設定 CLAUDE_API_KEY，已取消 AI 校對。")
@@ -1323,6 +1474,9 @@ class OCRProcessor:
     def process_pdf(self, pdf_path: str, file_index: int = 0, file_total: int = 1):
         """Process a single PDF file."""
         cfg = self.config
+        if cfg.enable_claude:
+            self._log("[離線校正] 已停用 Claude API，改用本機詞庫與上下文校正。")
+            cfg.enable_claude = False
         file_name = os.path.basename(pdf_path)
         stem = os.path.splitext(file_name)[0]
         out_dir = self._resolve_output_path(pdf_path)
